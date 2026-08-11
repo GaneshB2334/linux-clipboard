@@ -29,13 +29,13 @@ export default function App() {
   // the popup open without querying anything.
   useEffect(() => {
     const un = onDaemonEvent((event) => {
-      // Notices are messages, not list mutations — e.g. "on Wayland we could
-      // put this on the clipboard but cannot press Ctrl+V for you". A notice
-      // only ever fires when auto-paste did *not* happen, which means the
-      // popup was deliberately left open (see `act` below) so this toast has
-      // somewhere to show. Hiding afterward is unconditional and safe even if
-      // the window somehow was already hidden — `hide()` on a hidden window is
-      // a no-op.
+      // Notices are messages, not list mutations. Only reachable from X11 now
+      // — the daemon-side attempt at "hide, then let the daemon try Ctrl+V"
+      // failed to restore focus (rare). Wayland has no daemon-side attempt at
+      // all right now, so it never reaches this path; see `act`'s "paste"
+      // case below for how it shows its own toast instead. Hiding afterward
+      // is unconditional and safe even if the window is already hidden —
+      // `hide()` on a hidden window is a no-op.
       if (event.event === "notice") {
         setToast(event.message);
         setTimeout(() => {
@@ -129,14 +129,27 @@ export default function App() {
       switch (action) {
         case "paste":
         case "plain": {
-          // Checked fresh on every paste, not cached: on Wayland this can flip
-          // from false to true mid-session the moment the user answers the
-          // one-time portal permission dialog. If we can inject the keystroke,
-          // hide first — the daemon needs focus back on the target window
-          // before it presses Ctrl+V. If we can't, stay open; the "notice"
-          // handler above closes the window once the toast has been shown.
-          if (await api.canAutopaste()) await api.hide();
-          await api.paste(item.id, action === "plain");
+          // Checked fresh on every paste, not cached: whether auto-paste is
+          // possible can change between one paste and the next (Wayland only
+          // right now — auto-paste isn't implemented yet, so this is always
+          // false there; kept dynamic for when it is).
+          const auto = await api.canAutopaste();
+          if (auto) {
+            // The daemon needs focus back on the target window before it
+            // presses Ctrl+V, so hide before asking it to paste.
+            await api.hide();
+            await api.paste(item.id, action === "plain");
+          } else {
+            // No daemon event is coming to tell us to close — auto-paste
+            // was never attempted, so nothing will fire one. Set the
+            // clipboard, say so, then close ourselves once that's been read.
+            await api.paste(item.id, action === "plain");
+            setToast("Copied — press Ctrl+V to paste");
+            setTimeout(() => {
+              setToast(null);
+              void api.hide();
+            }, 1100);
+          }
           break;
         }
         case "copy":
