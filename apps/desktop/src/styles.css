@@ -1,0 +1,49 @@
+@import "tailwindcss";
+
+/*
+ * Follows the desktop's light/dark preference automatically via the Settings
+ * portal, so the popup matches GNOME without the user picking a theme.
+ */
+@variant dark (&:where(.dark, .dark *), @media (prefers-color-scheme: dark));
+
+:root {
+  /* system-ui resolves to Ubuntu/Cantarell here, so the popup uses the same
+     typeface as the rest of the desktop rather than announcing itself. */
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+/*
+ * Deliberately no backdrop-filter: WebKitGTK's implementation is slow and
+ * composites badly on Linux, and it is the most common cause of a Tauri window
+ * feeling janky on GNOME. A solid background costs nothing and looks correct.
+ */
+
+::selection {
+  background: color-mix(in oklab, oklch(0.62 0.19 255) 30%, transparent);
+}
+
+/* Thin, unobtrusive scrollbars — the list is keyboard-driven. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklab, currentColor 20%, transparent) transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

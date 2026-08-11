@@ -1,0 +1,20 @@
+# Rust
+/target
+
+# Node
+node_modules
+dist
+
+# Tauri generated schemas and bundles
+apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/target/
+
+# Clipboard history — never commit: this is real user data
+*.db
+*.db-wal
+*.db-shm
+blobs/
+
+# Logs and OS cruft
+*.log
+.DS_Store

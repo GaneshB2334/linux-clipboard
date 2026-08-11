@@ -1,0 +1,3 @@
+# esbuild ships a prebuilt binary and needs its install script to run.
+allowBuilds:
+  esbuild: true

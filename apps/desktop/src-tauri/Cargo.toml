@@ -1,0 +1,26 @@
+[package]
+name = "clipd-desktop"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "clipd_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+# Without `custom-protocol` the binary loads `devUrl` (http://localhost:1420)
+# instead of the bundled frontend, so a plain `cargo build --release` produces a
+# window showing "Connection refused". `tauri build` passes this automatically;
+# making it the default keeps a bare cargo build working too.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[dependencies]
+clipd-ipc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = [] }

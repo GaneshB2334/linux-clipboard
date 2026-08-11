@@ -1,0 +1,16 @@
+[package]
+name = "clipd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "clipd"
+path = "src/main.rs"
+
+[dependencies]
+clipd-ipc.workspace = true
+clipd-core.workspace = true
+clipd-platform.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "clipd-platform"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clipd-core.workspace = true
+clipd-ipc.workspace = true
+x11rb.workspace = true
+anyhow.workspace = true
+libc = "0.2"

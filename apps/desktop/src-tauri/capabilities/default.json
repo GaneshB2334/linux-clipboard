@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for the clipboard popup window. Without this file, Tauri v2 denies every core plugin command — custom commands still work, so the list loads, but core:event listen() is refused and the UI never sees added/removed events.",
+  "windows": ["popup"],
+  "permissions": [
+    "core:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:event:allow-emit",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "core:window:allow-center",
+    "core:window:allow-is-visible"
+  ]
+}

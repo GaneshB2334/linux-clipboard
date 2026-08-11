@@ -1,0 +1,15 @@
+[package]
+name = "clipctl"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "clipctl"
+path = "src/main.rs"
+
+# Kept dependency-free on purpose: this binary is what a Wayland compositor
+# keybinding spawns, so its process start time is on the hotkey critical path.
+[dependencies]
+clipd-ipc.workspace = true
+serde_json.workspace = true
