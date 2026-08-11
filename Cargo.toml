@@ -34,7 +34,10 @@ ts-rs = "12.0"
 # remote_desktop's own source references the screencast module (combined
 # remote-desktop+screen-share sessions are the same portal), so it must be
 # enabled too even though we only ever select DeviceType::Keyboard.
-ashpd = { version = "0.13", default-features = false, features = ["tokio", "remote_desktop", "screencast"] }
+# "wayland" enables WindowIdentifier::from_wayland_raw, needed to parent the
+# permission dialog to the popup window — without a real parent window GNOME
+# answers Start() with Cancelled instead of ever prompting.
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "remote_desktop", "screencast", "wayland"] }
 tokio = { version = "1", features = ["rt", "time"] }
 
 [profile.release]

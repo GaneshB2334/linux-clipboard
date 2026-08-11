@@ -106,14 +106,6 @@ pub enum Request {
     /// and takes mouse clicks but never receives keys. The daemon activates it
     /// via EWMH instead, which is permitted to bypass that.
     FocusPopup,
-    /// Is Wayland auto-paste ready right now?
-    ///
-    /// Only meaningful on Wayland — X11 never needs to ask, since the UI's fast
-    /// path answers `true` locally without reaching the daemon. On Wayland this
-    /// reflects whether the RemoteDesktop portal session has been granted
-    /// keyboard access, which may still be pending the one-time permission
-    /// dialog.
-    PortalStatus,
     /// Ask the daemon to stream events on this connection.
     Subscribe,
     Ping,
@@ -127,7 +119,6 @@ pub enum Response {
     Ok,
     Error { message: String },
     Pong,
-    PortalStatus { ready: bool },
 }
 
 /// Pushed to subscribed clients. The warm UI keeps its list current from these,

@@ -21,6 +21,15 @@
 //! this file is async; `inject_ctrl_v` is a plain blocking call from the
 //! caller's point of view.
 //!
+//! **This module is used from the UI process, not the daemon.** The portal
+//! needs a real window to parent its permission dialog to — passing no window
+//! identifier is what made an earlier version of this code get its grant
+//! request answered `Cancelled` instead of prompting. The daemon is headless
+//! and has no window at all, so it cannot supply one; the Tauri popup can,
+//! since it is created once at startup and kept alive (hidden) for the whole
+//! process lifetime, giving a stable window reference to reuse for every
+//! grant/paste.
+//!
 //! **A session is never held open longer than one paste.** GNOME Shell shows
 //! a persistent "remote access" indicator in the top bar for as long as a
 //! `RemoteDesktop` session with a granted device stays open — confirmed by
@@ -60,6 +69,41 @@ pub const FOCUS_SETTLE: Duration = Duration::from_millis(80);
 
 fn token_path() -> PathBuf {
     clipd_ipc::data_dir().join("portal-restore-token")
+}
+
+/// A stable reference to the popup window, captured once when it is created.
+///
+/// Carries raw pointer/ID values rather than `raw_window_handle` types
+/// directly: those types are deliberately not `Send` (dereferencing them
+/// isn't safe from an arbitrary thread on every backend), and the whole point
+/// here is handing this to this module's own background thread.
+///
+/// # Safety of the `Send` impl below
+/// The popup window is created once at startup and never destroyed for the
+/// process's lifetime (it is only ever hidden, never dropped — see
+/// `apps/desktop/src-tauri/src/lib.rs`), so the surface/display these point
+/// to stay valid for as long as any `PortalHandle` referencing them exists.
+#[derive(Clone, Copy)]
+pub enum WindowRef {
+    X11 {
+        xid: std::os::raw::c_ulong,
+    },
+    Wayland {
+        surface: *mut std::ffi::c_void,
+        display: *mut std::ffi::c_void,
+    },
+}
+unsafe impl Send for WindowRef {}
+
+async fn identifier(window: WindowRef) -> Option<ashpd::WindowIdentifier> {
+    match window {
+        WindowRef::X11 { xid } => Some(ashpd::WindowIdentifier::from_xid(xid)),
+        WindowRef::Wayland { surface, display } => {
+            // SAFETY: see the `Send` impl doc on `WindowRef` above — the
+            // window that produced these pointers outlives every use of them.
+            unsafe { ashpd::WindowIdentifier::from_wayland_raw(surface, display).await }
+        }
+    }
 }
 
 enum PortalCmd {
@@ -109,20 +153,20 @@ impl PortalHandle {
 /// The first-ever run may leave the background thread blocked for up to
 /// [`GRANT_TIMEOUT`] waiting on the permission dialog; nothing else in the
 /// daemon waits on it — [`PortalHandle::is_ready`] just reads an atomic.
-pub fn spawn() -> PortalHandle {
+pub fn spawn(window: WindowRef) -> PortalHandle {
     let ready = Arc::new(AtomicBool::new(token_path().exists()));
     let (tx, rx) = std::sync::mpsc::channel();
 
     let thread_ready = ready.clone();
     std::thread::Builder::new()
         .name("clipd-portal".into())
-        .spawn(move || run(thread_ready, rx))
+        .spawn(move || run(thread_ready, rx, window))
         .expect("failed to spawn clipd-portal thread");
 
     PortalHandle { tx, ready }
 }
 
-fn run(ready: Arc<AtomicBool>, cmds: Receiver<PortalCmd>) {
+fn run(ready: Arc<AtomicBool>, cmds: Receiver<PortalCmd>, window: WindowRef) {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -133,7 +177,7 @@ fn run(ready: Arc<AtomicBool>, cmds: Receiver<PortalCmd>) {
     };
 
     if !ready.load(Ordering::Relaxed) {
-        match rt.block_on(prime()) {
+        match rt.block_on(prime(window)) {
             Ok(()) => {
                 ready.store(true, Ordering::SeqCst);
                 eprintln!(
@@ -154,7 +198,7 @@ fn run(ready: Arc<AtomicBool>, cmds: Receiver<PortalCmd>) {
                     let _ = reply.send(Err("portal session was not granted".into()));
                     continue;
                 }
-                let result = rt.block_on(inject_once());
+                let result = rt.block_on(inject_once(window));
                 let _ = reply.send(result.map_err(|e| e.to_string()));
             }
         }
@@ -173,8 +217,8 @@ fn drain_with_error(cmds: Receiver<PortalCmd>, message: &str) {
 /// Obtain (or confirm) a restore token, then close the session immediately —
 /// this exists purely to get the token onto disk, never to inject anything,
 /// so the indicator does not stay lit past this one handshake.
-async fn prime() -> Result<()> {
-    let (_proxy, session) = establish().await?;
+async fn prime(window: WindowRef) -> Result<()> {
+    let (_proxy, session) = establish(window).await?;
     let _ = session.close().await;
     Ok(())
 }
@@ -182,8 +226,8 @@ async fn prime() -> Result<()> {
 /// Open a session using the saved token (silent — no dialog), inject one
 /// Ctrl+V, close the session. The indicator is visible only for this brief
 /// window, not for the daemon's lifetime.
-async fn inject_once() -> Result<()> {
-    let (proxy, session) = establish().await?;
+async fn inject_once(window: WindowRef) -> Result<()> {
+    let (proxy, session) = establish(window).await?;
     let result = inject(&proxy, &session).await;
     // Always close, even on failure, so a failed paste never leaves the
     // indicator lit.
@@ -191,7 +235,7 @@ async fn inject_once() -> Result<()> {
     result
 }
 
-async fn establish() -> Result<(RemoteDesktop, Session<RemoteDesktop>)> {
+async fn establish(window: WindowRef) -> Result<(RemoteDesktop, Session<RemoteDesktop>)> {
     let proxy = RemoteDesktop::new()
         .await
         .map_err(|e| anyhow!("could not reach the RemoteDesktop portal: {e}"))?;
@@ -216,11 +260,16 @@ async fn establish() -> Result<(RemoteDesktop, Session<RemoteDesktop>)> {
         .response()
         .map_err(|e| anyhow!("SelectDevices was refused: {e}"))?;
 
+    // A real parent window is required for GNOME to present the dialog at
+    // all: with no identifier, an earlier version of this code got Start()
+    // answered `Cancelled` outright instead of ever prompting.
+    let parent = identifier(window).await;
+
     // This call is the one that shows the system permission dialog, unless
     // the restore_token above let the portal grant silently.
     let start = tokio::time::timeout(
         GRANT_TIMEOUT,
-        proxy.start(&session, None, Default::default()),
+        proxy.start(&session, parent.as_ref(), Default::default()),
     )
     .await;
     let request = match start {
