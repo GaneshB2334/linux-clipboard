@@ -6,29 +6,22 @@
 //! layout from scratch. That is the whole reason it can feel instant; every
 //! other optimisation is noise next to not doing the work at open time.
 //!
-//! This process also owns the Wayland `RemoteDesktop` portal (see
-//! `clipd_platform::portal`), not the daemon. The portal needs a real window
-//! to parent its permission dialog to, and the daemon is headless — this
-//! process has the one window in the whole system that can supply one, and
-//! it is created once and kept alive for the process's entire lifetime, so
-//! the window reference captured at startup stays valid throughout.
+//! Wayland auto-paste is driven from here rather than the daemon, simply
+//! because this process is the one that knows when the popup has finished
+//! hiding — the keystroke has to land after focus returns to the user's real
+//! window. The injection itself is done by the clipd GNOME Shell extension
+//! (see `clipd_platform::shell_ext`), which needs no permission and shows no
+//! indicator.
 
 mod daemon;
 
 use std::time::Duration;
 
 use clipd_ipc::{Item, Request};
-use clipd_platform::portal::{PortalHandle, WindowRef};
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawWindowHandle};
+use clipd_platform::shell_ext;
 use tauri::{Emitter, Manager, WebviewWindow};
 
 const POPUP: &str = "popup";
-
-/// Tauri-managed state. `portal` is `None` on X11 (never needed there) and
-/// also `None` on Wayland if a window handle could not be obtained.
-struct AppState {
-    portal: Option<PortalHandle>,
-}
 
 #[tauri::command]
 fn recent(limit: u32) -> Result<Vec<Item>, String> {
@@ -40,48 +33,38 @@ fn search(query: String, limit: u32) -> Result<Vec<Item>, String> {
     daemon::items(&Request::Search { query, limit })
 }
 
-/// Can we auto-paste right now — hide the popup before injecting, rather than
-/// waiting to see whether it worked?
+/// Can we auto-paste right now — i.e. should the popup hide *before* the
+/// paste, rather than stay up to say "press Ctrl+V"?
 ///
-/// On X11 this is always true, answered locally with no IPC at all. On
-/// Wayland it reflects whether the RemoteDesktop portal holds a saved grant —
-/// checked fresh on every paste, not cached, since it can flip from false to
-/// true mid-session the moment the user answers the one-time permission
-/// dialog.
+/// Always true on X11 (XTEST works, answered locally with no IPC). On Wayland
+/// it is true only when the clipd GNOME Shell extension is installed and
+/// enabled, since nothing else may inject a keystroke there. Checked fresh on
+/// every paste, never cached — the user can enable or disable the extension
+/// at any time, and a stale answer would leave auto-paste silently off.
 #[tauri::command]
-fn can_autopaste(state: tauri::State<AppState>) -> bool {
-    if !clipd_ipc::is_wayland() {
-        return true;
-    }
-    state.portal.as_ref().map(|p| p.is_ready()).unwrap_or(false)
+fn can_autopaste() -> bool {
+    !clipd_ipc::is_wayland() || shell_ext::is_available()
 }
 
 #[tauri::command]
-fn paste(state: tauri::State<AppState>, id: i64, plain: bool) -> Result<(), String> {
-    // Set the clipboard first regardless of platform — this always succeeds
-    // independently of whether a keystroke can be injected afterward.
+fn paste(id: i64, plain: bool) -> Result<(), String> {
+    // Set the clipboard first. This succeeds on every platform, independently
+    // of whether a keystroke can be injected afterward — so even a failed
+    // auto-paste always leaves the item ready for a manual Ctrl+V.
     daemon::request(&Request::Paste { id, plain })?;
 
-    // Auto-paste itself is entirely local to this process on Wayland: the
-    // daemon only ever sets the clipboard there (see clipd/src/main.rs), it
-    // never attempts injection, because it has no window to parent a portal
-    // dialog to. Hiding is the caller's job (see App.tsx): it must happen
-    // *before* this call, decided by the same `can_autopaste` check, so by
-    // the time we get here the popup is already out of the way and the
-    // compositor has had a moment ([`clipd_platform::portal::FOCUS_SETTLE`])
-    // to hand focus back to the window that was behind it.
-    if clipd_ipc::is_wayland() {
-        if let Some(portal) = &state.portal {
-            if portal.is_ready() {
-                std::thread::sleep(clipd_platform::portal::FOCUS_SETTLE);
-                if let Err(e) = portal.inject_ctrl_v() {
-                    // The clipboard is already set either way; only the
-                    // keystroke failed. Logged, not surfaced — the window is
-                    // already hidden by this point (see the doc comment
-                    // above), so there is nowhere left to show a toast.
-                    eprintln!("clipd-desktop: portal paste failed: {e}");
-                }
-            }
+    // On X11 the daemon does the injection itself (XTEST, with focus restore).
+    // On Wayland it cannot, so we ask the shell extension instead. The caller
+    // hides the popup before invoking this (see App.tsx), gated on the same
+    // `can_autopaste` check, so focus is already on its way back to the user's
+    // real window by the time we get here.
+    if clipd_ipc::is_wayland() && shell_ext::is_available() {
+        std::thread::sleep(shell_ext::FOCUS_SETTLE);
+        if let Err(e) = shell_ext::paste() {
+            // The clipboard is set either way; only the keystroke failed. The
+            // popup is already hidden by now, so there is nowhere to show a
+            // toast — log it and leave the user a working manual Ctrl+V.
+            eprintln!("clipd-desktop: auto-paste failed: {e}");
         }
     }
     Ok(())
@@ -147,36 +130,6 @@ fn toggle(window: &WebviewWindow) {
     }
 }
 
-/// Extract a stable [`WindowRef`] from the popup for the portal to reuse.
-///
-/// Only the Wayland arm is expected to fire in practice — the portal is only
-/// spawned when [`clipd_ipc::is_wayland`] — but the X11 arm costs nothing to
-/// keep and documents that this path is not Wayland-specific in principle.
-///
-/// **Disabled on Wayland for now.** Forcing GTK to realize its widget, then
-/// handing the resulting display pointer to `ashpd::WindowIdentifier::from_wayland_raw`,
-/// crashed the process outright: `Protocol error 0 on object zxdg_exporter_v2`.
-/// Root cause: `from_wayland_raw` opens its *own* independent `wayland-client`
-/// connection on the same raw display pointer GTK's main loop is already
-/// pumping, and the two race reading the same socket. The correct fix is to
-/// export the foreign handle through GDK's own integration instead
-/// (`gdk_wayland_window_export_handle` — callback-based, fires once GTK's
-/// main loop is running, requires care around main-thread ownership), not a
-/// second connection. Not yet implemented — the X11 arm below is unaffected
-/// and left in place since it costs nothing to keep.
-fn window_ref(window: &WebviewWindow) -> Option<WindowRef> {
-    if clipd_ipc::is_wayland() {
-        return None;
-    }
-    let wh = window.window_handle().ok()?;
-    let dh = window.display_handle().ok()?;
-    match (wh.as_raw(), dh.as_raw()) {
-        (RawWindowHandle::Xlib(w), _) => Some(WindowRef::X11 { xid: w.window }),
-        (RawWindowHandle::Xcb(w), _) => Some(WindowRef::X11 { xid: w.window.get().into() }),
-        _ => None,
-    }
-}
-
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -192,22 +145,6 @@ pub fn run() {
             hide_popup,
         ])
         .setup(|app| {
-            let portal = if clipd_ipc::is_wayland() {
-                match app.get_webview_window(POPUP).and_then(|w| window_ref(&w)) {
-                    Some(window) => Some(clipd_platform::portal::spawn(window)),
-                    None => {
-                        eprintln!(
-                            "clipd-desktop: could not get a window handle for the popup; \
-                             Wayland auto-paste is unavailable this session (Ctrl+V still works)"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            app.manage(AppState { portal });
-
             let handle = app.handle().clone();
 
             // Bridge daemon events onto the webview. Reconnects on its own, so

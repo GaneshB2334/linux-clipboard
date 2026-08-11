@@ -25,12 +25,3 @@ clipd-platform.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = [] }
-# Only used to match on RawWindowHandle::Wayland/RawDisplayHandle::Wayland and
-# extract plain pointer values for clipd_platform::portal::WindowRef — see the
-# Portal setup in lib.rs for why a real window handle matters here.
-raw-window-handle = "0.6"
-# Version pinned to match what Tauri's own Linux backend already resolves to
-# (see Cargo.lock) so `gtk_window()`'s return type and our direct gtk calls
-# agree on the same crate instance. Needed only to force-realize the popup's
-# GTK widget before it has ever been shown — see `window_ref` in lib.rs.
-gtk = "0.18"

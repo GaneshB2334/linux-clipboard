@@ -28,17 +28,11 @@ serde_json = "1.0"
 anyhow = "1.0"
 ts-rs = "12.0"
 
-# Wayland auto-paste (RemoteDesktop portal). Pure D-Bus, no system libdbus
-# headers needed. Confined to crates/clipd-platform/src/portal.rs and its own
-# background thread — the rest of the daemon stays synchronous/thread-based.
-# remote_desktop's own source references the screencast module (combined
-# remote-desktop+screen-share sessions are the same portal), so it must be
-# enabled too even though we only ever select DeviceType::Keyboard.
-# "wayland" enables WindowIdentifier::from_wayland_raw, needed to parent the
-# permission dialog to the popup window — without a real parent window GNOME
-# answers Start() with Cancelled instead of ever prompting.
-ashpd = { version = "0.13", default-features = false, features = ["tokio", "remote_desktop", "screencast", "wayland"] }
-tokio = { version = "1", features = ["rt", "time"] }
+# Talks to the clipd GNOME Shell extension over the session bus for Wayland
+# auto-paste. Pure Rust D-Bus — no system libdbus headers needed. Default
+# features give both async-io and the blocking API; only the blocking API is
+# used, on a path that is already synchronous.
+zbus = "5"
 
 [profile.release]
 opt-level = 3
