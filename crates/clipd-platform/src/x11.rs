@@ -865,6 +865,3 @@ fn keycode_for(conn: &RustConnection, keysym: u32) -> Result<Option<u8>> {
     }
     Ok(None)
 }
-
-/// Keysym for `v`, for callers configuring the default Super+V hotkey.
-pub const HOTKEY_V: u32 = KEYSYM_V;

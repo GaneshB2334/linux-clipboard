@@ -100,20 +100,60 @@ Cause: GNOME Shell registers its shortcuts as **XI2 passive grabs**
 `GrabKey` registers without `BadAccess` and is then shadowed — Mutter consumes
 the key first.
 
-Consequence: the hotkey must come from GNOME's own mechanism, a
-`custom-keybinding` in gsettings that spawns `clipctl toggle`. This is a better
-answer anyway — it is the same code path Wayland needs, where `XGrabKey` does
-not exist at all. `scripts/install-hotkey.sh` registers it, refuses to stomp on
-a binding another app owns, and has `--uninstall`.
+Consequence: grab the way Mutter does. The daemon now uses an **XI2 passive
+grab** (`XIPassiveGrabDevice`) instead of core `GrabKey`. Measured side by side
+on the same combination with clean modifier state: core received **0** events,
+XI2 received **all** of them.
 
-The daemon now skips the core grab entirely when `XDG_CURRENT_DESKTOP` contains
-GNOME, rather than reporting a success that will never fire. The `XGrabKey` path
-is retained for plain X11 window managers (i3, XFCE, Openbox) that have no
-equivalent mechanism.
+Two further findings from that measurement:
 
-*Caveat on the diagnosis:* a `Ctrl+Alt+V` control test was contaminated — that
-combination is bound by another application on this machine. The conclusion
-rests on `Super+V` plus the minimal-spike result.
+- **Mutter reserves the entire `Super+<key>` space.** An XI2 grab on
+  `Super+Shift+V` comes back with *every* modifier variant rejected, so no
+  third-party client can bind any Super combination. Those must be registered
+  with GNOME itself (Settings → Keyboard → Custom Shortcuts, running
+  `clipctl toggle`). Non-Super combinations grab cleanly and work in-process
+  with no configuration at all.
+- **Passive grabs match modifier state exactly.** Every lock-modifier variant
+  (`Lock`, `Mod2`, both) must be grabbed separately or the hotkey silently
+  stops working with Caps or Num Lock on.
+
+*Caveat on the diagnosis:* an early `Ctrl+Alt+V` control test was contaminated —
+that combination is bound by another application on this machine — and a later
+run was invalidated by a stuck `Shift` left behind by an XTEST test, which made
+the actual modifier state `0x1d` when `0x1c` was grabbed. Both were re-run
+clean; `spikes/src/bin/clear_mods.rs` exists to release stuck modifiers after
+synthetic-input testing.
+
+*Note:* an earlier `scripts/install-hotkey.sh` registered the GNOME
+custom-keybinding automatically. It was removed after it wrote a malformed
+`custom-keybindings` array (see Finding 7) — the GUI is the safe path.
+
+## Finding 7 — a malformed gsettings array took down every media key
+
+The worst incident of the project, and worth recording because the failure was
+so disproportionate to the mistake.
+
+`gsettings get ... custom-keybindings` prints an empty list as `@as []` — a
+GVariant *type annotation*, not a value. A script that stripped the punctuation
+turned `@as` into a list **element** and wrote back
+`['@as', '/org/.../clipd/']`. That single bogus entry made `gsd-media-keys`
+**segfault** (`code=dumped, signal=SEGV`), and because that one process owns
+*all* media-key shortcuts, terminal, screen-lock, volume and the rest died with
+it. Resetting the settings was not sufficient — the crashed unit is `static`
+and refuses manual start, so it had to be brought back through its target.
+
+A second bug in the same script: `"${ARR[@]:-}"` expands an *empty* bash array
+to one empty string, which then gets written back as a stray `''` entry.
+
+Rules taken from this:
+
+- **Never programmatically write a gsettings array that a live daemon parses.**
+  Reading is fine. For shortcuts, GNOME's own Settings GUI cannot produce a
+  malformed value; a script can.
+- If a write is unavoidable, construct the value with a real parser, then read
+  it back and verify every prior entry survived before trusting it.
+- Prefer mechanisms that touch no shared config at all — the XI2 grab
+  (Finding 6) and the shell extension both write nothing.
 
 ## Phase 1 — measured (2026-08-10)
 

@@ -22,13 +22,7 @@ path = "src/bin/x11_paste.rs"
 name = "send-hotkey"
 path = "src/bin/send_hotkey.rs"
 
-[[bin]]
-name = "grab-test"
-path = "src/bin/grab_test.rs"
 
-[[bin]]
-name = "xi-grab-test"
-path = "src/bin/xi_grab_test.rs"
 
 [[bin]]
 name = "clear-mods"

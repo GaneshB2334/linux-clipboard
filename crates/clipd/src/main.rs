@@ -141,12 +141,11 @@ fn main() -> Result<()> {
                 // XTEST cannot reach native Wayland clients and EWMH cannot
                 // see their windows, so the X11 backend's own Cmd::Paste
                 // (which relies on both) would silently do nothing there.
-                // On Wayland only ever set the clipboard; auto-paste itself
-                // is owned by the UI process now, which has a real window to
-                // parent the portal's permission dialog to — the daemon,
-                // being headless, cannot supply one at all. See
+                // On Wayland only ever set the clipboard; the injection is
+                // done by the UI process via the GNOME Shell extension, which
+                // also knows when the popup has finished hiding. See
                 // apps/desktop/src-tauri/src/lib.rs and
-                // crates/clipd-platform/src/portal.rs.
+                // crates/clipd-platform/src/shell_ext.rs.
                 let wants_xtest_paste = paste && !clipd_platform::is_wayland();
                 let cmd =
                     if wants_xtest_paste { Cmd::Paste { flavors } } else { Cmd::Offer { flavors } };
@@ -165,10 +164,6 @@ fn main() -> Result<()> {
                 if let Err(e) = backend.send(Cmd::FocusPopup) {
                     eprintln!("clipd: backend send failed: {e}");
                 }
-            }
-
-            Msg::Reap => {
-                let _ = hub.subscriber_count();
             }
         }
     }

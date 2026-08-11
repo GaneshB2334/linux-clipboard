@@ -10,6 +10,19 @@ members = [
     "apps/desktop/src-tauri",
 ]
 
+# `spikes/` holds hand-run diagnostic tools for the X11/Wayland backends, not
+# part of the product. Excluding it here keeps `cargo build` and CI from
+# compiling them every time; `cargo build -p spikes` still works when one is
+# actually needed.
+default-members = [
+    "crates/clipd-ipc",
+    "crates/clipd-core",
+    "crates/clipd-platform",
+    "crates/clipd",
+    "crates/clipctl",
+    "apps/desktop/src-tauri",
+]
+
 [workspace.package]
 edition = "2021"
 rust-version = "1.85"
