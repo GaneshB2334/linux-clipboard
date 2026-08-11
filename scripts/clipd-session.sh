@@ -8,7 +8,16 @@
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$ROOT/target/release"
+
+# Prefer the installed copies so autostart keeps working after `cargo clean`
+# wipes target/; fall back to the build tree for running straight from a
+# checkout without installing.
+if [ -x "$HOME/.local/bin/clipd" ]; then
+    BIN="$HOME/.local/bin"
+else
+    BIN="$ROOT/target/release"
+fi
+
 LOGDIR="${XDG_DATA_HOME:-$HOME/.local/share}/clipd"
 mkdir -p "$LOGDIR"
 
