@@ -28,6 +28,15 @@ serde_json = "1.0"
 anyhow = "1.0"
 ts-rs = "12.0"
 
+# Wayland auto-paste (RemoteDesktop portal). Pure D-Bus, no system libdbus
+# headers needed. Confined to crates/clipd-platform/src/portal.rs and its own
+# background thread — the rest of the daemon stays synchronous/thread-based.
+# remote_desktop's own source references the screencast module (combined
+# remote-desktop+screen-share sessions are the same portal), so it must be
+# enabled too even though we only ever select DeviceType::Keyboard.
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "remote_desktop", "screencast"] }
+tokio = { version = "1", features = ["rt", "time"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

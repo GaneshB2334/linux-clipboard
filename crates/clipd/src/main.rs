@@ -67,8 +67,17 @@ fn main() -> Result<()> {
     // instead; the backend reports that case distinctly.
     let (mut backend, _thread) = x11::spawn(sig_tx, Some(hotkey))?;
 
+    // Capture and setting the clipboard still work on Wayland — Mutter bridges
+    // selections to and from XWayland — so the X11 backend above runs
+    // unconditionally. What it *cannot* do there is inject a keystroke into
+    // another application's window (XTEST reaches only XWayland clients) or
+    // find that window to restore focus to it (EWMH cannot see native Wayland
+    // windows). The portal is the only sanctioned replacement for that one
+    // piece, so it is only started when it is actually needed.
+    let portal = clipd_platform::is_wayland().then(clipd_platform::portal::spawn);
+
     let hub = Arc::new(Hub::new());
-    server::listen(Arc::clone(&hub), Arc::clone(&store), tx.clone())?;
+    server::listen(Arc::clone(&hub), Arc::clone(&store), tx.clone(), portal.clone())?;
     eprintln!("clipd: listening on {}", clipd_ipc::socket_path().display());
 
     while let Ok(msg) = rx.recv() {
@@ -137,6 +146,50 @@ fn main() -> Result<()> {
                     eprintln!("clipd: item {id} has no usable flavors");
                     continue;
                 }
+
+                if paste && clipd_platform::is_wayland() {
+                    // XTEST cannot reach native Wayland clients, so the X11
+                    // backend's own Cmd::Paste is a no-op here. Set the
+                    // clipboard through the ordinary path, then — if the
+                    // RemoteDesktop portal has been granted — inject Ctrl+V
+                    // ourselves.
+                    if let Err(e) = backend.send(Cmd::Offer { flavors }) {
+                        eprintln!("clipd: backend send failed: {e}");
+                        continue;
+                    }
+                    let ready = portal.as_ref().map(|p| p.is_ready()).unwrap_or(false);
+                    let injected = ready
+                        && portal
+                            .as_ref()
+                            .map(|p| {
+                                // The UI hides itself before requesting a paste;
+                                // give the compositor a moment to hand focus
+                                // back to the window that was behind it.
+                                std::thread::sleep(clipd_platform::portal::FOCUS_SETTLE);
+                                match p.inject_ctrl_v() {
+                                    Ok(()) => {
+                                        eprintln!("clipd: portal paste injected Ctrl+V");
+                                        true
+                                    }
+                                    Err(e) => {
+                                        eprintln!("clipd: portal paste failed: {e}");
+                                        false
+                                    }
+                                }
+                            })
+                            .unwrap_or(false);
+                    if !injected {
+                        let message = if ready {
+                            "Copied — press Ctrl+V to paste (auto-paste failed this time)"
+                        } else {
+                            "Copied — press Ctrl+V to paste (grant clipd input access to \
+                             enable auto-paste — check for a system permission dialog)"
+                        };
+                        hub.broadcast(&Event::Notice { message: message.into() });
+                    }
+                    continue;
+                }
+
                 let cmd = if paste { Cmd::Paste { flavors } } else { Cmd::Offer { flavors } };
                 if let Err(e) = backend.send(cmd) {
                     eprintln!("clipd: backend send failed: {e}");

@@ -10,7 +10,7 @@ mod daemon;
 
 use std::time::Duration;
 
-use clipd_ipc::{Item, Request};
+use clipd_ipc::{Item, Request, Response};
 use tauri::{Emitter, Manager, WebviewWindow};
 
 const POPUP: &str = "popup";
@@ -25,27 +25,30 @@ fn search(query: String, limit: u32) -> Result<Vec<Item>, String> {
     daemon::items(&Request::Search { query, limit })
 }
 
-/// Can the daemon press Ctrl+V into the previously focused app for us?
+/// Can we auto-paste right now — hide the popup before injecting, rather than
+/// waiting to see whether it worked?
 ///
-/// False on Wayland, where injecting input into another application is not
-/// possible. The UI uses this to decide whether to close immediately (X11) or
-/// stay open long enough to say "press Ctrl+V" (Wayland).
+/// On X11 this is always true and answered locally (no daemon round trip on
+/// the popup-open critical path). On Wayland it reflects whether the
+/// RemoteDesktop portal session has actually been granted, which can flip
+/// from false to true mid-session the moment the user answers the one-time
+/// permission dialog — so this is checked fresh on every paste rather than
+/// cached at startup.
 #[tauri::command]
 fn can_autopaste() -> bool {
-    !clipd_ipc::is_wayland()
+    if !clipd_ipc::is_wayland() {
+        return true;
+    }
+    matches!(daemon::request(&Request::PortalStatus), Ok(Response::PortalStatus { ready: true }))
 }
 
 #[tauri::command]
-fn paste(window: WebviewWindow, id: i64, plain: bool) -> Result<(), String> {
-    // On X11, hide first: the daemon restores focus to the window that had it
-    // before we opened, and it cannot do that while we still hold focus.
-    //
-    // On Wayland there is no focus to restore and no keystroke to inject, so
-    // hiding here would swallow the notice telling the user to press Ctrl+V.
-    // The UI closes itself once that toast has been seen.
-    if !clipd_ipc::is_wayland() {
-        let _ = window.hide();
-    }
+fn paste(id: i64, plain: bool) -> Result<(), String> {
+    // Hiding is the caller's job now (see App.tsx): it must happen *before*
+    // this call, decided by a fresh `can_autopaste` check, because whether to
+    // hide first (X11, or Wayland once granted) or stay open until the
+    // "press Ctrl+V" toast has been seen (Wayland, not yet granted) depends on
+    // information the frontend already has to fetch anyway.
     daemon::request(&Request::Paste { id, plain }).map(|_| ())
 }
 

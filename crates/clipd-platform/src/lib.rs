@@ -12,6 +12,7 @@
 
 use clipd_core::Captured;
 
+pub mod portal;
 pub mod x11;
 
 /// Commands the daemon sends to the platform thread.

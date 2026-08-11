@@ -30,10 +30,18 @@ export default function App() {
   useEffect(() => {
     const un = onDaemonEvent((event) => {
       // Notices are messages, not list mutations — e.g. "on Wayland we could
-      // put this on the clipboard but cannot press Ctrl+V for you".
+      // put this on the clipboard but cannot press Ctrl+V for you". A notice
+      // only ever fires when auto-paste did *not* happen, which means the
+      // popup was deliberately left open (see `act` below) so this toast has
+      // somewhere to show. Hiding afterward is unconditional and safe even if
+      // the window somehow was already hidden — `hide()` on a hidden window is
+      // a no-op.
       if (event.event === "notice") {
         setToast(event.message);
-        setTimeout(() => setToast(null), 3200);
+        setTimeout(() => {
+          setToast(null);
+          void api.hide();
+        }, 3200);
         return;
       }
       setItems((prev) => {
@@ -120,11 +128,17 @@ export default function App() {
       if (!item) return;
       switch (action) {
         case "paste":
-          await api.paste(item.id, false);
+        case "plain": {
+          // Checked fresh on every paste, not cached: on Wayland this can flip
+          // from false to true mid-session the moment the user answers the
+          // one-time portal permission dialog. If we can inject the keystroke,
+          // hide first — the daemon needs focus back on the target window
+          // before it presses Ctrl+V. If we can't, stay open; the "notice"
+          // handler above closes the window once the toast has been shown.
+          if (await api.canAutopaste()) await api.hide();
+          await api.paste(item.id, action === "plain");
           break;
-        case "plain":
-          await api.paste(item.id, true);
-          break;
+        }
         case "copy":
           await api.copy(item.id);
           break;

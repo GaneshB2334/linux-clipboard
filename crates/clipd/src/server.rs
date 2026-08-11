@@ -64,7 +64,17 @@ impl Default for Hub {
 }
 
 /// Bind the socket and start accepting. Returns immediately.
-pub fn listen(hub: Arc<Hub>, store: Arc<Mutex<Store>>, tx: Sender<Msg>) -> Result<()> {
+///
+/// `portal` is `None` on X11 (never spawned there) and also `None` on
+/// Wayland until [`clipd_platform::portal::spawn`] returns — the handle
+/// itself exists immediately, only [`clipd_platform::portal::PortalHandle::is_ready`]
+/// takes time to become true.
+pub fn listen(
+    hub: Arc<Hub>,
+    store: Arc<Mutex<Store>>,
+    tx: Sender<Msg>,
+    portal: Option<clipd_platform::portal::PortalHandle>,
+) -> Result<()> {
     let path = clipd_ipc::socket_path();
 
     // Unix socket paths are capped at ~108 bytes by the kernel, and the raw
@@ -98,10 +108,11 @@ pub fn listen(hub: Arc<Hub>, store: Arc<Mutex<Store>>, tx: Sender<Msg>) -> Resul
             let hub = Arc::clone(&hub);
             let store = Arc::clone(&store);
             let tx = tx.clone();
+            let portal = portal.clone();
             std::thread::Builder::new()
                 .name("clipd-conn".into())
                 .spawn(move || {
-                    if let Err(e) = serve_conn(stream, hub, store, tx) {
+                    if let Err(e) = serve_conn(stream, hub, store, tx, portal) {
                         eprintln!("clipd: connection ended: {e}");
                     }
                 })
@@ -117,6 +128,7 @@ fn serve_conn(
     hub: Arc<Hub>,
     store: Arc<Mutex<Store>>,
     tx: Sender<Msg>,
+    portal: Option<clipd_platform::portal::PortalHandle>,
 ) -> Result<()> {
     let mut out = stream.try_clone()?;
     let reader = BufReader::new(stream);
@@ -134,7 +146,7 @@ fn serve_conn(
             }
         };
 
-        let response = handle(request, &hub, &store, &tx, &out)?;
+        let response = handle(request, &hub, &store, &tx, &out, &portal)?;
         if let Some(response) = response {
             out.write_all(&encode(&response)?)?;
             out.flush()?;
@@ -150,6 +162,7 @@ fn handle(
     store: &Arc<Mutex<Store>>,
     tx: &Sender<Msg>,
     out: &UnixStream,
+    portal: &Option<clipd_platform::portal::PortalHandle>,
 ) -> Result<Option<Response>> {
     let response = match request {
         Request::Ping => Response::Pong,
@@ -225,6 +238,10 @@ fn handle(
             tx.send(Msg::Action(Action::FocusPopup)).ok();
             Response::Ok
         }
+
+        Request::PortalStatus => Response::PortalStatus {
+            ready: portal.as_ref().map(|p| p.is_ready()).unwrap_or(false),
+        },
 
         Request::Subscribe => {
             hub.subscribe(out.try_clone()?);
