@@ -27,8 +27,6 @@ pub enum Action {
 pub enum Msg {
     Signal(clipd_platform::Signal),
     Action(Action),
-    /// A subscriber disconnected; prune it on the next broadcast.
-    Reap,
 }
 
 /// Tracks subscribed connections and fans events out to them.
@@ -46,14 +44,13 @@ impl Hub {
     }
 
     /// Push to every subscriber, dropping any that has gone away.
+    ///
+    /// This is the only place subscribers are reaped — a failed write means the
+    /// peer is gone, so no separate disconnect bookkeeping is needed.
     pub fn broadcast(&self, event: &Event) {
         let Ok(frame) = encode(event) else { return };
         let mut subs = self.subs.lock().unwrap();
         subs.retain_mut(|s| s.write_all(&frame).and_then(|_| s.flush()).is_ok());
-    }
-
-    pub fn subscriber_count(&self) -> usize {
-        self.subs.lock().unwrap().len()
     }
 }
 
@@ -112,12 +109,7 @@ pub fn listen(hub: Arc<Hub>, store: Arc<Mutex<Store>>, tx: Sender<Msg>) -> Resul
     Ok(())
 }
 
-fn serve_conn(
-    stream: UnixStream,
-    hub: Arc<Hub>,
-    store: Arc<Mutex<Store>>,
-    tx: Sender<Msg>,
-) -> Result<()> {
+fn serve_conn(stream: UnixStream, hub: Arc<Hub>, store: Arc<Mutex<Store>>, tx: Sender<Msg>) -> Result<()> {
     let mut out = stream.try_clone()?;
     let reader = BufReader::new(stream);
 
@@ -140,7 +132,6 @@ fn serve_conn(
             out.flush()?;
         }
     }
-    let _ = tx.send(Msg::Reap);
     Ok(())
 }
 
@@ -179,10 +170,6 @@ fn handle(
             hub.broadcast(&Event::Removed { id });
             Response::Ok
         }
-
-        Request::UndoDelete => Response::Error {
-            message: "undo is not implemented yet".into(),
-        },
 
         Request::Pin { id, pinned } => {
             let item = {

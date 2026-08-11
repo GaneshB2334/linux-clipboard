@@ -6,12 +6,21 @@
 //! this line changes.
 //!
 //! Backend status:
-//!   * [`x11`]      — implemented and verified (see docs/phase-0-findings.md)
-//!   * `portal`     — GNOME Wayland via RemoteDesktop + Clipboard portals (planned)
-//!   * `datacontrol`— wlr/ext-data-control for KDE, wlroots, GNOME 48+ (planned)
+//!   * [`x11`]       — capture, clipboard ownership, XTEST paste, XI2 hotkey.
+//!     Also carries capture and clipboard writes on Wayland, since Mutter
+//!     bridges selections to and from XWayland (see docs/phase-0-findings.md).
+//!   * [`shell_ext`] — Wayland auto-paste via the clipd GNOME Shell extension.
+//!   * `datacontrol` — wlr/ext-data-control for KDE, wlroots, GNOME 48+ (planned)
+//!
+//! A `RemoteDesktop`-portal backend was implemented and then removed: it needs
+//! a permission grant, and GNOME shows a persistent "remote access" indicator
+//! for as long as the session is open — both disproportionate for pressing one
+//! key. See `shell_ext`'s module docs, and commit 97cdc71 for the portal code
+//! if a non-GNOME Wayland compositor ever needs it.
 
 use clipd_core::Captured;
 
+pub mod shell_ext;
 pub mod x11;
 
 /// Commands the daemon sends to the platform thread.

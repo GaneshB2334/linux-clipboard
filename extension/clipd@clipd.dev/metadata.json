@@ -1,0 +1,8 @@
+{
+  "uuid": "clipd@clipd.dev",
+  "name": "clipd paste helper",
+  "description": "Lets clipd paste for you on Wayland. Exposes a single D-Bus method that presses Ctrl+V using GNOME Shell's own virtual keyboard — no remote-desktop permission, and no 'screen is being shared' indicator in the top bar. Does nothing on its own; only useful with clipd installed.",
+  "shell-version": ["45", "46", "47", "48", "49"],
+  "session-modes": ["user"],
+  "url": "https://github.com/GaneshB2334/linux-clipboard"
+}

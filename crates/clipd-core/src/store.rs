@@ -54,7 +54,6 @@ pub struct Store {
     /// the same bytes when the owning app exits, so identical content arriving
     /// again is a re-offer, not a new copy. See docs/phase-0-findings.md.
     head_hash: Option<[u8; 32]>,
-    last_deleted: Option<i64>,
 }
 
 impl Store {
@@ -75,7 +74,7 @@ impl Store {
              PRAGMA foreign_keys = ON;",
         )?;
 
-        let mut store = Self { conn, blobs, head_hash: None, last_deleted: None };
+        let mut store = Self { conn, blobs, head_hash: None };
         store.migrate()?;
         store.head_hash = store.load_head_hash()?;
         Ok(store)
@@ -350,14 +349,12 @@ impl Store {
         Ok(())
     }
 
-    /// Soft-delete semantics for the undo toast: the row goes, but we remember
-    /// which one so `undo_delete` can be wired to a real restore later.
+    /// Remove an item and its search-index entry.
     pub fn delete(&mut self, id: i64) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM items_fts WHERE rowid = ?1", params![id])?;
         tx.execute("DELETE FROM items WHERE id = ?1", params![id])?;
         tx.commit()?;
-        self.last_deleted = Some(id);
         self.head_hash = self.load_head_hash()?;
         Ok(())
     }

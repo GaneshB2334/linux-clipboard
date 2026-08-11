@@ -95,16 +95,16 @@ fn main() -> Result<()> {
 
             Msg::Signal(Signal::Hotkey) => hub.broadcast(&Event::Toggle),
 
+            // Only ever fires for X11's own paste attempts now — Wayland
+            // pastes never send Cmd::Paste to the X11 backend (see the
+            // Action::Offer handler below), so this can only mean focus
+            // restore failed on X11 itself.
             Msg::Signal(Signal::Pasted { injected }) => {
                 if !injected {
                     // The content *is* on the clipboard either way; only the
                     // synthetic keystroke failed. Tell the user rather than
                     // leaving the popup looking broken.
-                    let message = if clipd_platform::is_wayland() {
-                        "Copied — press Ctrl+V to paste (Wayland cannot auto-paste yet)"
-                    } else {
-                        "Copied — press Ctrl+V to paste (could not return focus)"
-                    };
+                    let message = "Copied — press Ctrl+V to paste (could not return focus)";
                     eprintln!("clipd: {message}");
                     hub.broadcast(&Event::Notice { message: message.into() });
                 }
@@ -137,7 +137,18 @@ fn main() -> Result<()> {
                     eprintln!("clipd: item {id} has no usable flavors");
                     continue;
                 }
-                let cmd = if paste { Cmd::Paste { flavors } } else { Cmd::Offer { flavors } };
+
+                // XTEST cannot reach native Wayland clients and EWMH cannot
+                // see their windows, so the X11 backend's own Cmd::Paste
+                // (which relies on both) would silently do nothing there.
+                // On Wayland only ever set the clipboard; the injection is
+                // done by the UI process via the GNOME Shell extension, which
+                // also knows when the popup has finished hiding. See
+                // apps/desktop/src-tauri/src/lib.rs and
+                // crates/clipd-platform/src/shell_ext.rs.
+                let wants_xtest_paste = paste && !clipd_platform::is_wayland();
+                let cmd =
+                    if wants_xtest_paste { Cmd::Paste { flavors } } else { Cmd::Offer { flavors } };
                 if let Err(e) = backend.send(cmd) {
                     eprintln!("clipd: backend send failed: {e}");
                 }
@@ -153,10 +164,6 @@ fn main() -> Result<()> {
                 if let Err(e) = backend.send(Cmd::FocusPopup) {
                     eprintln!("clipd: backend send failed: {e}");
                 }
-            }
-
-            Msg::Reap => {
-                let _ = hub.subscriber_count();
             }
         }
     }

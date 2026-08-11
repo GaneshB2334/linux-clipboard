@@ -10,3 +10,4 @@ clipd-ipc.workspace = true
 x11rb.workspace = true
 anyhow.workspace = true
 libc = "0.2"
+zbus.workspace = true

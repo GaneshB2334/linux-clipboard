@@ -83,8 +83,6 @@ pub enum Request {
         #[ts(type = "number")]
         id: i64,
     },
-    /// Restore the most recently deleted item (drives the undo toast).
-    UndoDelete,
     Pin {
         #[ts(type = "number")]
         id: i64,

@@ -10,6 +10,19 @@ members = [
     "apps/desktop/src-tauri",
 ]
 
+# `spikes/` holds hand-run diagnostic tools for the X11/Wayland backends, not
+# part of the product. Excluding it here keeps `cargo build` and CI from
+# compiling them every time; `cargo build -p spikes` still works when one is
+# actually needed.
+default-members = [
+    "crates/clipd-ipc",
+    "crates/clipd-core",
+    "crates/clipd-platform",
+    "crates/clipd",
+    "crates/clipctl",
+    "apps/desktop/src-tauri",
+]
+
 [workspace.package]
 edition = "2021"
 rust-version = "1.85"
@@ -27,6 +40,12 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
 ts-rs = "12.0"
+
+# Talks to the clipd GNOME Shell extension over the session bus for Wayland
+# auto-paste. Pure Rust D-Bus — no system libdbus headers needed. Default
+# features give both async-io and the blocking API; only the blocking API is
+# used, on a path that is already synchronous.
+zbus = "5"
 
 [profile.release]
 opt-level = 3

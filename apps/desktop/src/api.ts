@@ -16,6 +16,13 @@ export const api = {
     invoke<void>("set_favorite", { id, favorite }),
   clearAll: () => invoke<void>("clear_all"),
   hide: () => invoke<void>("hide_popup"),
+  /**
+   * Always true on X11. On Wayland, reflects whether the RemoteDesktop portal
+   * session has actually been granted keyboard access — check fresh before
+   * each paste, don't cache: it can flip true mid-session once the user
+   * answers the one-time permission dialog.
+   */
+  canAutopaste: () => invoke<boolean>("can_autopaste"),
 };
 
 export const onDaemonEvent = (fn: (e: ClipEvent) => void) =>
