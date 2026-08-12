@@ -40,6 +40,16 @@ const KEY_RELEASE: u8 = 3;
 const KEYSYM_V: u32 = 0x0076;
 const KEYSYM_CONTROL_L: u32 = 0xffe3;
 
+// stderr here always ends up in a log file (clipd-session redirects it), never
+// a live terminal, so a tty check at write time would be checking the wrong
+// thing — it would see a pipe and strip the colour. Terminals interpret ANSI
+// escapes based on who's *displaying* the file, not who wrote it, so emitting
+// them unconditionally is what makes `cat daemon.log` actually readable later.
+const ANSI_GREEN: &str = "\x1b[1;32m";
+const ANSI_YELLOW: &str = "\x1b[1;33m";
+const ANSI_CYAN: &str = "\x1b[1;36m";
+const ANSI_RESET: &str = "\x1b[0m";
+
 /// Private target carried on everything we put on the clipboard. First line of
 /// the loop guard; the store's head-hash check is the second, because GNOME
 /// strips this on its ownership hand-off.
@@ -189,25 +199,52 @@ impl Backend {
         };
 
         if let Some(hk) = hotkey {
-            let mut mods = ModMask::default();
-            if hk.sup {
-                mods = ModMask::from(mods.bits() | ModMask::M4.bits());
-            }
-            if hk.ctrl {
-                mods = ModMask::from(mods.bits() | ModMask::CONTROL.bits());
-            }
-            if hk.alt {
-                mods = ModMask::from(mods.bits() | ModMask::M1.bits());
-            }
-            if hk.shift {
-                mods = ModMask::from(mods.bits() | ModMask::SHIFT.bits());
-            }
-            match backend.grab_hotkey(hk.keysym, mods) {
-                Ok(kc) => {
-                    eprintln!("clipd: hotkey grabbed (keycode {kc}, mods 0x{:x})", mods.bits());
-                    backend.hotkey_keycode = Some(kc);
+            if backend.wayland {
+                // XIGrabKeycode against XWayland reports success unconditionally
+                // — the call has no error to return — but Mutter, running as a
+                // Wayland compositor, never routes a *global* key event through
+                // XWayland that way. The grab is real and inert: attempting it
+                // and then logging "hotkey grabbed" would be a daemon reporting
+                // a capability it does not have, exactly the kind of false
+                // positive this project has already been burned by once (the
+                // portal's "ready" state that never actually pasted).
+                //
+                // GNOME's own Custom Shortcuts mechanism has none of this
+                // problem: it spawns `clipctl toggle` as a real process, which
+                // works identically on X11 and Wayland. clipd-session registers
+                // one automatically (see ensure_shortcut in build-deb.sh), so
+                // this is informational, not an action the user has to take.
+                eprintln!(
+                    "{ANSI_YELLOW}clipd: Wayland session{ANSI_RESET} — the in-process \
+                     hotkey grab can't deliver global key events here, so it was \
+                     skipped. {ANSI_CYAN}Ctrl+Alt+C{ANSI_RESET} is instead bound via a \
+                     GNOME custom shortcut running `clipctl toggle` — set up \
+                     automatically at login."
+                );
+            } else {
+                let mut mods = ModMask::default();
+                if hk.sup {
+                    mods = ModMask::from(mods.bits() | ModMask::M4.bits());
                 }
-                Err(e) => eprintln!("clipd: could not grab hotkey: {e}"),
+                if hk.ctrl {
+                    mods = ModMask::from(mods.bits() | ModMask::CONTROL.bits());
+                }
+                if hk.alt {
+                    mods = ModMask::from(mods.bits() | ModMask::M1.bits());
+                }
+                if hk.shift {
+                    mods = ModMask::from(mods.bits() | ModMask::SHIFT.bits());
+                }
+                match backend.grab_hotkey(hk.keysym, mods) {
+                    Ok(kc) => {
+                        eprintln!(
+                            "{ANSI_GREEN}clipd: hotkey grabbed{ANSI_RESET} (keycode {kc}, mods 0x{:x})",
+                            mods.bits()
+                        );
+                        backend.hotkey_keycode = Some(kc);
+                    }
+                    Err(e) => eprintln!("clipd: could not grab hotkey: {e}"),
+                }
             }
         }
 

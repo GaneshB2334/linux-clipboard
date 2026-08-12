@@ -65,6 +65,95 @@ if [ -r "$HOTKEY_FILE" ]; then
     [ -n "${line:-}" ] && HOTKEY="$line"
 fi
 
+# Enable the paste extension on first login after install.
+#
+# This cannot live in the package's postinst: that runs as root, and an
+# extension being enabled is per-user dconf state, so root would either fail
+# for want of a session bus or write it into root's own profile.
+#
+# `gnome-extensions` is GNOME's own CLI and updates the enabled-extensions
+# array correctly. That distinction matters here: hand-editing that array is
+# what once wrote a malformed value and segfaulted gsd-media-keys, taking
+# every media shortcut down with it.
+#
+# Idempotent, and quiet on non-GNOME desktops where the command is absent.
+if command -v gnome-extensions >/dev/null 2>&1; then
+    if ! gnome-extensions list --enabled 2>/dev/null | grep -qx "clipd@clipd.dev"; then
+        gnome-extensions enable clipd@clipd.dev >/dev/null 2>&1 || true
+    fi
+fi
+
+# Register a working Ctrl+Alt+C shortcut with no manual step, on X11 or
+# Wayland alike. The in-process XI2 grab (x11.rs) only ever works on X11;
+# GNOME's own custom-keybindings mechanism spawns `clipctl toggle` as a real
+# process regardless of session type, so it's the one path that always works
+# — this is the same mechanism Settings > Keyboard > Custom Shortcuts writes
+# to, just done for the user instead of leaving them to find that screen.
+#
+# Deliberately narrow in scope: only ADDS our own slot if it's missing, never
+# touches any other key (including Super+V/toggle-message-tray, which has its
+# own separate risk of collision and stays a documented manual opt-in). Every
+# launch, not just the first — cheap, and self-heals if the slot is ever lost
+# — but a slot that already exists, ours or hand-edited, is left alone.
+#
+# Values are read back and verified before being trusted; on anything
+# unexpected the array write is rolled back rather than left half-applied.
+# That caution is deliberate: the last time this array was hand-edited (not
+# here — a one-off script, since deleted) a malformed entry crashed
+# gsd-media-keys and took every media key down with it. Real GNOME CLI/parser
+# only, python3's `ast.literal_eval` for the array, nothing string-hacked.
+ensure_shortcut() {
+    command -v gsettings >/dev/null 2>&1 || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    case "${XDG_CURRENT_DESKTOP:-}" in *GNOME*) : ;; *) return 0 ;; esac
+
+    list_schema="org.gnome.settings-daemon.plugins.media-keys"
+    item_schema="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding"
+    slot="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/clipd/"
+
+    before="$(gsettings get "$list_schema" custom-keybindings 2>/dev/null)" || return 0
+    case "$before" in *"$slot"*) return 0 ;; esac  # already registered
+
+    after="$(python3 - "$before" "$slot" <<'PY'
+import ast, sys
+raw, slot = sys.argv[1].strip(), sys.argv[2]
+items = list(ast.literal_eval(raw)) if raw.startswith("[") else []
+items = [i for i in items if isinstance(i, str) and i]
+if slot not in items:
+    items.append(slot)
+print("[" + ", ".join(repr(i) for i in items) + "]")
+PY
+    )" || return 0
+    [ -n "$after" ] || return 0
+
+    gsettings set "$list_schema" custom-keybindings "$after" 2>/dev/null || return 0
+
+    # Verify nothing was lost and nothing malformed made it in; roll back
+    # rather than trust a write that doesn't check out.
+    if ! python3 - "$before" "$(gsettings get "$list_schema" custom-keybindings 2>/dev/null)" "$slot" <<'PY'
+import ast, sys
+def parse(s):
+    s = s.strip()
+    return list(ast.literal_eval(s)) if s.startswith("[") else []
+old, new, slot = parse(sys.argv[1]), parse(sys.argv[2]), sys.argv[3]
+ok = (
+    all(x in new for x in old)
+    and slot in new
+    and all(isinstance(x, str) and x for x in new)
+)
+sys.exit(0 if ok else 1)
+PY
+    then
+        gsettings set "$list_schema" custom-keybindings "$before" 2>/dev/null || true
+        return 0
+    fi
+
+    gsettings set "$item_schema:$slot" name "Clipboard Manager" 2>/dev/null || true
+    gsettings set "$item_schema:$slot" command "\"'/usr/bin/clipctl' toggle\"" 2>/dev/null || true
+    gsettings set "$item_schema:$slot" binding "<Primary><Alt>c" 2>/dev/null || true
+}
+ensure_shortcut
+
 pgrep -x clipd >/dev/null 2>&1 || \
     CLIPD_HOTKEY="$HOTKEY" /usr/bin/clipd >> "$LOGDIR/daemon.log" 2>&1 &
 
@@ -116,7 +205,7 @@ Version: ${VERSION}
 Section: utils
 Priority: optional
 Architecture: ${ARCH}
-Depends: libwebkit2gtk-4.1-0, libgtk-3-0t64 | libgtk-3-0, libjavascriptcoregtk-4.1-0
+Depends: libwebkit2gtk-4.1-0, libgtk-3-0t64 | libgtk-3-0, libjavascriptcoregtk-4.1-0, python3
 Recommends: gnome-shell
 Installed-Size: ${INSTALLED_KB}
 Maintainer: Ganesh Bastapure <GaneshB2334@users.noreply.github.com>
@@ -144,25 +233,21 @@ if [ -x /usr/bin/gtk-update-icon-cache ]; then
     gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true
 fi
 
-cat <<'EOF'
+GREEN='\033[1;32m'; CYAN='\033[1;36m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; RESET='\033[0m'
 
-clipd is installed. Log out and back in to start it.
-
-That also loads the paste extension, which GNOME only picks up at session
-start. Then enable it once:
-
-    gnome-extensions enable clipd@clipd.dev
-
-Without it clipd still copies, and tells you to press Ctrl+V yourself.
-
-The popup opens with Ctrl+Alt+C. For Super+V, add a shortcut in
-Settings > Keyboard > Custom Shortcuts running:
-
-    clipctl toggle
-
-GNOME reserves every Super+key combination, so that is the only way to use one.
-
-EOF
+printf '\n'
+printf "${BOLD}clipd is installed.${RESET}\n"
+printf "${YELLOW}➜ One thing left: log out and back in.${RESET}\n"
+printf "  (That's a GNOME requirement, not clipd's — a freshly installed\n"
+printf "   Shell extension only loads at session start.)\n"
+printf '\n'
+printf "${GREEN}After that, press ${CYAN}Ctrl+Alt+C${GREEN} to open it. No setup needed${RESET}\n"
+printf "${GREEN}— it works the same on X11 and Wayland.${RESET}\n"
+printf '\n'
+printf "Want ${CYAN}Super+V${RESET} instead? GNOME reserves that combo for itself, so it's a\n"
+printf "manual step: Settings > Keyboard > Keyboard Shortcuts, scroll to the\n"
+printf "bottom, ${BOLD}+${RESET}, and set Command to:\n"
+printf "\n    ${CYAN}/usr/bin/clipctl toggle${RESET}\n\n"
 exit 0
 POSTINST
 chmod 755 "$BUILD/DEBIAN/postinst"
