@@ -23,6 +23,13 @@ export const api = {
    * answers the one-time permission dialog.
    */
   canAutopaste: () => invoke<boolean>("can_autopaste"),
+  /**
+   * Fired the instant a press lands on the header's drag area, before Tauri's
+   * own drag-region script asks the window manager to start moving the
+   * window. That handshake causes a brief, spurious focus-loss event — see
+   * the Rust side's `drag_hint` command for why this exists.
+   */
+  dragHint: () => invoke<void>("drag_hint"),
 };
 
 export const onDaemonEvent = (fn: (e: ClipEvent) => void) =>

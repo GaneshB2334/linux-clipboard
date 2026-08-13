@@ -19,6 +19,7 @@ export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const headerRef = useRef<HTMLElement>(null);
 
   // ---- data ------------------------------------------------------------
 
@@ -182,7 +183,7 @@ export default function App() {
   // ---- keyboard --------------------------------------------------------
 
   const onKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
+    (e: KeyboardEvent) => {
       // Alt+1..9 pastes the Nth item outright. Bare digits stay available for
       // typing a search, which is the more common action by far.
       if (e.altKey && /^[1-9]$/.test(e.key)) {
@@ -245,18 +246,61 @@ export default function App() {
     inputRef.current?.focus();
   }, []);
 
+  // On window, not the panel: clicking anything non-focusable (empty list
+  // space, the preview pane, a row) blurs the input and hands focus to
+  // <body>, which sits *above* the panel in the tree — a listener on the
+  // panel would never see events that originate there. Esc (and every other
+  // shortcut) has to keep working no matter what has focus, so the listener
+  // lives here instead of in onKeyDown JSX.
+  useEffect(() => {
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onKeyDown]);
+
+  // Tauri's own `data-tauri-drag-region` script asks the window manager to
+  // start moving the window on every qualifying mousedown, which the WM
+  // acknowledges with a brief, real `Focused(false)` — indistinguishable
+  // from an actual focus loss unless something records that a drag might be
+  // starting first (see drag_hint in lib.rs). Capture phase, not bubble:
+  // Tauri's script calls `stopImmediatePropagation()`, which would otherwise
+  // block a bubble-phase listener on window from ever running.
+  useEffect(() => {
+    const onPointerDown = (e: MouseEvent) => {
+      const header = headerRef.current;
+      const target = e.target as Node | null;
+      if (header && target && header.contains(target) && target !== inputRef.current) {
+        void api.dragHint();
+      }
+    };
+    window.addEventListener("mousedown", onPointerDown, { capture: true });
+    return () => window.removeEventListener("mousedown", onPointerDown, { capture: true });
+  }, []);
+
   const current = matches[selected]?.item;
 
   return (
     // Transparent inset around the panel: this is what the rounded corners
     // and shadow actually show against, now that the window itself has no
     // background of its own (tauri.conf.json's `transparent: true`).
-    <div className="h-screen w-full p-3" onKeyDown={onKeyDown}>
+    <div className="h-screen w-full p-3">
       <div
         ref={panelRef}
         className="pop-in relative flex h-full flex-col overflow-hidden rounded-2xl border border-black/10 bg-neutral-50 text-neutral-900 shadow-[0_20px_50px_-12px_rgba(0,0,0,0.45),0_0_0_0.5px_rgba(0,0,0,0.06)] dark:border-white/10 dark:bg-neutral-900 dark:text-neutral-100 dark:shadow-[0_20px_50px_-12px_rgba(0,0,0,0.7),0_0_0_0.5px_rgba(255,255,255,0.06)]"
       >
-        <header className="flex items-center gap-2.5 border-b border-black/[0.06] px-4 py-3 dark:border-white/[0.06]">
+        {/* The window has no title bar (decorations: false), so this is the
+            only way to move it. `"deep"` (Tauri's own drag-region mode, not
+            hand-rolled here) makes any non-interactive descendant of the
+            header a drag handle — the icon, the count badge, the padding —
+            while automatically excluding real controls like the search
+            input, so a plain click there still just focuses it. Also needs
+            core:window:allow-start-dragging in capabilities/default.json;
+            Tauri v2 denies every window command that isn't explicitly
+            allowlisted, silently, which is why this did nothing at first. */}
+        <header
+          ref={headerRef}
+          data-tauri-drag-region="deep"
+          className="flex cursor-grab items-center gap-2.5 border-b border-black/[0.06] px-4 py-3 active:cursor-grabbing dark:border-white/[0.06]"
+        >
           <SearchIcon />
           <input
             ref={inputRef}
@@ -268,7 +312,7 @@ export default function App() {
             placeholder="Search clipboard history…"
             spellCheck={false}
             autoComplete="off"
-            className="w-full bg-transparent text-[15px] outline-none placeholder:text-neutral-400"
+            className="w-full cursor-text bg-transparent text-[15px] outline-none placeholder:text-neutral-400"
           />
           <span className="shrink-0 rounded-full bg-black/5 px-2 py-0.5 text-[11px] font-medium tabular-nums text-neutral-500 dark:bg-white/10 dark:text-neutral-400">
             {matches.length}

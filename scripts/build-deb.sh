@@ -160,8 +160,15 @@ pgrep -x clipd >/dev/null 2>&1 || \
 SOCKET="${XDG_RUNTIME_DIR:-/tmp}/clipd.sock"
 for _ in $(seq 1 50); do [ -S "$SOCKET" ] && break; sleep 0.1; done
 
+# Forces XWayland instead of a native Wayland surface. Wayland deliberately
+# hides a client's absolute screen position from itself (a privacy
+# restriction X11 has none of), so outer_position() always reads back (0, 0)
+# and set_position() is a no-op on a native Wayland toplevel — dragging the
+# popup and having it remember where it was left both need a real position,
+# which only XWayland provides. Harmless on an X11 session: XWayland is
+# already what X11 *is* there, so this is a no-op.
 pgrep -x clipd-desktop >/dev/null 2>&1 || \
-    /usr/bin/clipd-desktop >> "$LOGDIR/ui.log" 2>&1 &
+    GDK_BACKEND=x11 /usr/bin/clipd-desktop >> "$LOGDIR/ui.log" 2>&1 &
 
 wait
 LAUNCHER

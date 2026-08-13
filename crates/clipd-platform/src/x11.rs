@@ -717,12 +717,18 @@ impl Backend {
     /// indication is allowed to bypass that — the same mechanism that makes
     /// focus restore work after a paste.
     fn focus_popup(&self) -> Result<()> {
-        // On Wayland the popup is a native Wayland surface with no X11 window
-        // to activate, and the compositor decides focus. Trying anyway just
-        // logged "popup window not mapped" on every single open.
-        if self.wayland {
-            return Ok(());
-        }
+        // Used to skip this entirely on a Wayland session: the popup was a
+        // native Wayland surface with no X11 window to activate, so trying
+        // just logged "popup window not mapped" on every single open.
+        //
+        // That's no longer true. clipd-session now launches clipd-desktop
+        // with GDK_BACKEND=x11 (see its comment for why — window positioning
+        // needed it too), so the popup is *always* a real XWayland window
+        // now, discoverable here exactly like any other X11 client, on X11
+        // and Wayland sessions alike. `self.wayland` reflects the session
+        // type, not this window's own backend, so gating on it here was
+        // right before that change and wrong after it.
+        //
         // The window may not be mapped the instant the UI asks, so give it a
         // brief window to appear rather than failing on a race.
         let deadline = Instant::now() + Duration::from_millis(300);

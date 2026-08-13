@@ -15,13 +15,69 @@
 
 mod daemon;
 
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use clipd_ipc::{Item, Request};
 use clipd_platform::shell_ext;
-use tauri::{Emitter, Manager, WebviewWindow};
+use tauri::{Emitter, Manager, PhysicalPosition, Position, WebviewWindow};
 
 const POPUP: &str = "popup";
+
+/// Same plain single-line-file convention `clipd-session` already uses for
+/// the hotkey config (`~/.config/clipd/hotkey`) — one pair of numbers doesn't
+/// need a JSON dependency.
+fn position_file() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
+    base.join("clipd").join("window-position")
+}
+
+fn save_position(window: &WebviewWindow) {
+    if let Ok(pos) = window.outer_position() {
+        let path = position_file();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, format!("{},{}", pos.x, pos.y));
+    }
+}
+
+fn load_position() -> Option<(i32, i32)> {
+    let s = std::fs::read_to_string(position_file()).ok()?;
+    let (x, y) = s.trim().split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
+/// Hide, remembering where it was — so the *next* open, even after quitting
+/// and relaunching rather than just the next toggle in this session,
+/// reappears wherever it was last left instead of snapping back to the
+/// `center: true` default from tauri.conf.json every time.
+fn hide_and_remember(window: &WebviewWindow) {
+    save_position(window);
+    let _ = window.hide();
+}
+
+/// When the header's drag region was last pressed. Asking the window manager
+/// to start moving the window (`start_dragging`, triggered by
+/// `data-tauri-drag-region` in App.tsx) causes a brief, spurious
+/// `Focused(false)` as the WM takes over the pointer grab — indistinguishable
+/// from a real focus loss unless something remembers a drag just started.
+/// Without this, every click on the header (not just an actual drag) closed
+/// the popup before the drag could happen at all.
+struct DragHint(Mutex<Option<Instant>>);
+
+/// Generous on purpose: covers a real human drag-and-release, not just the
+/// WM handshake, since there is no reliable "drag ended" event on Linux to
+/// clear this early — the WM owns the pointer for the whole gesture.
+const DRAG_GRACE: Duration = Duration::from_millis(800);
+
+#[tauri::command]
+fn drag_hint(state: tauri::State<DragHint>) {
+    *state.0.lock().unwrap() = Some(Instant::now());
+}
 
 #[tauri::command]
 fn recent(limit: u32) -> Result<Vec<Item>, String> {
@@ -72,7 +128,7 @@ fn paste(id: i64, plain: bool) -> Result<(), String> {
 
 #[tauri::command]
 fn copy_item(window: WebviewWindow, id: i64) -> Result<(), String> {
-    let _ = window.hide();
+    hide_and_remember(&window);
     daemon::request(&Request::Copy { id }).map(|_| ())
 }
 
@@ -98,19 +154,21 @@ fn clear_all() -> Result<(), String> {
 
 #[tauri::command]
 fn hide_popup(window: WebviewWindow) {
-    let _ = window.hide();
+    hide_and_remember(&window);
 }
 
 /// Show or hide, driven by the hotkey.
 fn toggle(window: &WebviewWindow) {
     match window.is_visible() {
         Ok(true) => {
-            let _ = window.hide();
+            hide_and_remember(window);
         }
         _ => {
-            // Re-centre each time: the pointer may have moved to another
-            // monitor since the last open.
-            let _ = window.center();
+            // Deliberately not re-centring here. `center: true` in
+            // tauri.conf.json places it on first launch; after that, leaving
+            // position alone is what lets a drag (the header is a
+            // data-tauri-drag-region — there's no title bar) actually stick
+            // between opens instead of snapping back every toggle.
             let _ = window.show();
             let _ = window.set_focus();
             let _ = window.emit("clipd://opened", ());
@@ -143,9 +201,20 @@ pub fn run() {
             set_favorite,
             clear_all,
             hide_popup,
+            drag_hint,
         ])
+        .manage(DragHint(Mutex::new(None)))
         .setup(|app| {
             let handle = app.handle().clone();
+
+            // Restore wherever the popup was left last time, overriding the
+            // `center: true` in tauri.conf.json that would otherwise place
+            // every fresh process start dead centre regardless of a past drag.
+            if let Some(window) = handle.get_webview_window(POPUP) {
+                if let Some((x, y)) = load_position() {
+                    let _ = window.set_position(Position::Physical(PhysicalPosition { x, y }));
+                }
+            }
 
             // Bridge daemon events onto the webview. Reconnects on its own, so
             // restarting clipd does not require restarting the UI.
@@ -181,13 +250,36 @@ pub fn run() {
         .on_window_event(|window, event| {
             // Closing the popup must not quit the app — the window is a
             // long-lived, pre-warmed resource, so hide it instead.
+            // `on_window_event` hands us a plain `Window`, not the
+            // `WebviewWindow` `hide_and_remember` takes — they're separate
+            // types in Tauri v2 with no shared Deref, so re-fetch the
+            // webview-flavored handle by label rather than duplicating the
+            // save/hide logic for both types.
+            let webview = window.get_webview_window(POPUP);
+
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                if let Some(w) = &webview {
+                    hide_and_remember(w);
+                }
             }
-            // Dismiss on focus loss, the way every launcher popup behaves.
+            // Dismiss on focus loss, the way every launcher popup behaves —
+            // unless that "loss" is actually the WM taking the pointer grab
+            // to start moving the window (see DragHint). Without this guard,
+            // every click on the header — not just an actual drag — closed
+            // the popup before a drag could ever happen.
             if let tauri::WindowEvent::Focused(false) = event {
-                let _ = window.hide();
+                let dragging = window
+                    .state::<DragHint>()
+                    .0
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|t| t.elapsed() < DRAG_GRACE);
+                if !dragging {
+                    if let Some(w) = &webview {
+                        hide_and_remember(w);
+                    }
+                }
             }
         })
         .run(tauri::generate_context!())
