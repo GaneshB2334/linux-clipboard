@@ -18,6 +18,7 @@ export default function App() {
 
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
 
   // ---- data ------------------------------------------------------------
 
@@ -73,6 +74,17 @@ export default function App() {
       setSelected(0);
       listRef.current?.scrollTo({ top: 0 });
       inputRef.current?.focus();
+
+      // The webview is never remounted between opens (that's the whole point
+      // of pre-warming it), so a plain CSS animation on the panel would only
+      // ever play once. Removing and re-adding the class forces a reflow in
+      // between, which restarts it on every open instead.
+      const el = panelRef.current;
+      if (el) {
+        el.classList.remove("pop-in");
+        void el.offsetWidth;
+        el.classList.add("pop-in");
+      }
     });
     return () => {
       un.then((f) => f());
@@ -236,71 +248,87 @@ export default function App() {
   const current = matches[selected]?.item;
 
   return (
-    <div
-      className="flex h-screen flex-col overflow-hidden bg-neutral-50 text-neutral-900 dark:bg-neutral-900 dark:text-neutral-100"
-      onKeyDown={onKeyDown}
-    >
-      <header className="flex items-center gap-2 border-b border-neutral-200 px-3 py-2 dark:border-neutral-800">
-        <SearchIcon />
-        <input
-          ref={inputRef}
-          value={query}
-          onChange={(e) => {
-            setQuery(e.target.value);
-            setSelected(0);
-          }}
-          placeholder="Search clipboard history…"
-          spellCheck={false}
-          autoComplete="off"
-          className="w-full bg-transparent text-sm outline-none placeholder:text-neutral-400"
-        />
-        <span className="shrink-0 text-xs tabular-nums text-neutral-400">
-          {matches.length}
-        </span>
-      </header>
+    // Transparent inset around the panel: this is what the rounded corners
+    // and shadow actually show against, now that the window itself has no
+    // background of its own (tauri.conf.json's `transparent: true`).
+    <div className="h-screen w-full p-3" onKeyDown={onKeyDown}>
+      <div
+        ref={panelRef}
+        className="pop-in relative flex h-full flex-col overflow-hidden rounded-2xl border border-black/10 bg-neutral-50 text-neutral-900 shadow-[0_20px_50px_-12px_rgba(0,0,0,0.45),0_0_0_0.5px_rgba(0,0,0,0.06)] dark:border-white/10 dark:bg-neutral-900 dark:text-neutral-100 dark:shadow-[0_20px_50px_-12px_rgba(0,0,0,0.7),0_0_0_0.5px_rgba(255,255,255,0.06)]"
+      >
+        <header className="flex items-center gap-2.5 border-b border-black/[0.06] px-4 py-3 dark:border-white/[0.06]">
+          <SearchIcon />
+          <input
+            ref={inputRef}
+            value={query}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setSelected(0);
+            }}
+            placeholder="Search clipboard history…"
+            spellCheck={false}
+            autoComplete="off"
+            className="w-full bg-transparent text-[15px] outline-none placeholder:text-neutral-400"
+          />
+          <span className="shrink-0 rounded-full bg-black/5 px-2 py-0.5 text-[11px] font-medium tabular-nums text-neutral-500 dark:bg-white/10 dark:text-neutral-400">
+            {matches.length}
+          </span>
+        </header>
 
-      <div className="flex min-h-0 flex-1">
-        <div ref={listRef} className="min-w-0 flex-1 overflow-y-auto overscroll-contain">
-          {matches.length === 0 ? (
-            <Empty query={query} />
-          ) : (
-            <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
-              {virtualizer.getVirtualItems().map((v) => (
-                <div
-                  key={matches[v.index]!.item.id}
-                  className="absolute inset-x-0 top-0"
-                  style={{ height: v.size, transform: `translateY(${v.start}px)` }}
-                >
-                  <Row
-                    match={matches[v.index]!}
-                    active={v.index === selected}
-                    onSelect={() => setSelected(v.index)}
-                    onActivate={() => act(v.index, "paste")}
-                  />
-                </div>
-              ))}
-            </div>
-          )}
+        <div className="flex min-h-0 flex-1">
+          <div ref={listRef} className="min-w-0 flex-1 overflow-y-auto overscroll-contain px-2 py-2">
+            {matches.length === 0 ? (
+              <Empty query={query} />
+            ) : (
+              <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
+                {virtualizer.getVirtualItems().map((v) => (
+                  <div
+                    key={matches[v.index]!.item.id}
+                    className="absolute inset-x-0 top-0"
+                    style={{ height: v.size, transform: `translateY(${v.start}px)` }}
+                  >
+                    <Row
+                      match={matches[v.index]!}
+                      active={v.index === selected}
+                      onSelect={() => setSelected(v.index)}
+                      onActivate={() => act(v.index, "paste")}
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {current && <Preview item={current} />}
         </div>
 
-        {current && <Preview item={current} />}
-      </div>
+        <Footer />
 
-      <Footer />
-
-      {toast && (
-        <div className="pointer-events-none absolute bottom-12 left-1/2 -translate-x-1/2 rounded-md bg-neutral-900 px-3 py-1.5 text-xs text-white shadow-lg dark:bg-neutral-100 dark:text-neutral-900">
+        {/* Always mounted so the exit transition can actually play — a
+            conditionally-rendered toast would just vanish, never fade. */}
+        <div
+          className={[
+            "pointer-events-none absolute bottom-14 left-1/2 -translate-x-1/2 rounded-full bg-neutral-900/95 px-4 py-2 text-xs font-medium text-white shadow-lg transition-all duration-200 ease-out dark:bg-neutral-50/95 dark:text-neutral-900",
+            toast ? "translate-y-0 scale-100 opacity-100" : "translate-y-1 scale-95 opacity-0",
+          ].join(" ")}
+        >
           {toast}
         </div>
-      )}
+      </div>
     </div>
   );
 }
 
 function Empty({ query }: { query: string }) {
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-1 px-6 text-center">
-      <p className="text-sm text-neutral-500">
+    <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center">
+      <span
+        aria-hidden
+        className="grid size-10 place-items-center rounded-xl bg-black/5 text-lg dark:bg-white/10"
+      >
+        {query ? "🔍" : "📋"}
+      </span>
+      <p className="text-sm font-medium text-neutral-600 dark:text-neutral-300">
         {query ? "No matches" : "Nothing copied yet"}
       </p>
       <p className="text-xs text-neutral-400">
@@ -312,7 +340,7 @@ function Empty({ query }: { query: string }) {
 
 function Footer() {
   return (
-    <footer className="flex items-center gap-4 border-t border-neutral-200 px-3 py-1.5 text-[11px] text-neutral-500 dark:border-neutral-800">
+    <footer className="flex items-center gap-4 border-t border-black/[0.06] px-4 py-2 text-[11px] text-neutral-500 dark:border-white/[0.06] dark:text-neutral-400">
       <Key k="↑↓" label="Navigate" />
       <Key k="Enter" label="Paste" />
       <Key k="⇧Enter" label="Plain" />
@@ -325,8 +353,14 @@ function Footer() {
 
 function Key({ k, label }: { k: string; label: string }) {
   return (
-    <span className="flex items-center gap-1">
-      <kbd className="rounded border border-neutral-300 px-1 font-sans text-[10px] dark:border-neutral-700">
+    <span className="flex items-center gap-1.5">
+      <kbd
+        className={[
+          "rounded-[5px] border px-1.5 py-px font-sans text-[10px] font-medium",
+          "border-black/10 bg-white text-neutral-600 shadow-[0_1px_0_rgba(0,0,0,0.06)]",
+          "dark:border-white/10 dark:bg-white/10 dark:text-neutral-300 dark:shadow-[0_1px_0_rgba(0,0,0,0.3)]",
+        ].join(" ")}
+      >
         {k}
       </kbd>
       {label}

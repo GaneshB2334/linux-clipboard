@@ -31,13 +31,13 @@ export function Row({
       onMouseMove={onSelect}
       onClick={onActivate}
       className={[
-        "flex h-[52px] cursor-default items-center gap-3 px-3",
-        active ? "bg-blue-500/10 dark:bg-blue-400/15" : "",
+        "mx-1 flex h-[52px] cursor-default items-center gap-3 rounded-xl px-3 transition-colors duration-100",
+        active ? "bg-[oklch(0.62_0.19_255/12%)] dark:bg-[oklch(0.7_0.17_255/16%)]" : "",
       ].join(" ")}
     >
       <span
         aria-hidden
-        className="grid size-7 shrink-0 place-items-center rounded bg-neutral-200/60 text-sm dark:bg-neutral-800"
+        className="grid size-8 shrink-0 place-items-center rounded-[10px] bg-black/[0.04] text-sm dark:bg-white/[0.06]"
       >
         {item.kind === "color" ? (
           <span

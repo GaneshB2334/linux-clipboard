@@ -13,6 +13,11 @@
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
+
+  /* One accent, reused everywhere something needs to read as "selected" or
+     "primary": the active row, the search caret area, text selection. Picking
+     it once here is what keeps those in sync instead of drifting. */
+  --accent: oklch(0.62 0.19 255);
 }
 
 html,
@@ -21,16 +26,40 @@ body,
   height: 100%;
   margin: 0;
   overflow: hidden;
+  /* The window itself is transparent (tauri.conf.json) so the panel below can
+     float with real rounded corners, the way Spotlight/Raycast do — the OS
+     window is invisible, only the panel is drawn. */
+  background: transparent;
 }
 
 /*
- * Deliberately no backdrop-filter: WebKitGTK's implementation is slow and
- * composites badly on Linux, and it is the most common cause of a Tauri window
- * feeling janky on GNOME. A solid background costs nothing and looks correct.
+ * Deliberately no backdrop-filter anywhere, including behind the panel:
+ * WebKitGTK's implementation is slow and composites badly on Linux, and it is
+ * the most common cause of a Tauri window feeling janky on GNOME. The panel
+ * background stays fully opaque — only the margin around it is transparent —
+ * so the floating look costs nothing and there's nothing to blur.
  */
 
 ::selection {
-  background: color-mix(in oklab, oklch(0.62 0.19 255) 30%, transparent);
+  background: color-mix(in oklab, var(--accent) 30%, transparent);
+}
+
+/* Panel entrance: a quick scale+fade, not a bounce — the window is never
+   actually re-created between opens (see App.tsx's pop-in retrigger), so
+   this is what makes reopening still feel like something happened. */
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.pop-in {
+  animation: pop-in 160ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 /* Thin, unobtrusive scrollbars — the list is keyboard-driven. */

@@ -9,9 +9,9 @@ import type { Item } from "./api";
  */
 export function Preview({ item }: { item: Item }) {
   return (
-    <aside className="hidden w-[280px] shrink-0 flex-col gap-3 overflow-y-auto border-l border-neutral-200 p-3 sm:flex dark:border-neutral-800">
+    <aside className="hidden w-[280px] shrink-0 flex-col gap-3 overflow-y-auto border-l border-black/[0.06] p-4 sm:flex dark:border-white/[0.06]">
       {item.sensitive ? (
-        <div className="rounded-md border border-amber-300/50 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-400/20 dark:bg-amber-500/10 dark:text-amber-200">
+        <div className="rounded-xl border border-amber-300/50 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-400/20 dark:bg-amber-500/10 dark:text-amber-200">
           <strong className="block">Hidden</strong>
           This looked like a credential, so it was never written to disk or
           indexed for search.
@@ -29,7 +29,7 @@ export function Preview({ item }: { item: Item }) {
 
       {item.kind === "color" && (
         <div
-          className="h-12 w-full rounded-md ring-1 ring-black/10"
+          className="h-12 w-full rounded-xl ring-1 ring-black/10"
           style={{ background: item.preview }}
         />
       )}
