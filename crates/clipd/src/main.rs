@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! Copyright (C) 2026 Ganesh Bastapure
+//!
 //! The clipboard daemon: owns the history database and the platform backend.
 //!
 //! Deliberately GUI-free. The UI can hibernate or crash without losing a copy,
@@ -16,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use clipd_core::Store;
 use clipd_ipc::Event;
-use clipd_platform::{x11, Cmd, Hotkey, Signal};
+use clipd_platform::{Cmd, Hotkey, Signal};
 
 use server::{Action, Hub, Msg};
 
@@ -61,22 +64,44 @@ fn main() -> Result<()> {
         },
         Err(_) => Hotkey::super_v(),
     };
-    // The daemon grabs the key itself via XI2 — no configuration file is
+    // The daemon grabs the key itself via XI2 on X11 — no configuration file is
     // touched, so no existing shortcut can be disturbed. GNOME reserves every
     // Super+key combination, so those must be registered with the desktop
     // instead; the backend reports that case distinctly.
-    let (mut backend, _thread) = x11::spawn(sig_tx, Some(hotkey))?;
-
     let hub = Arc::new(Hub::new());
     server::listen(Arc::clone(&hub), Arc::clone(&store), tx.clone())?;
+
+    // Select exactly one clipboard backend. Native Wayland uses wl-clipboard
+    // and the GNOME extension path; X11 retains the event-driven XFIXES/XTEST
+    // implementation.
+    let (mut backend, _thread) = clipd_platform::spawn(sig_tx, Some(hotkey))?;
     eprintln!("clipd: listening on {}", clipd_ipc::socket_path().display());
 
     while let Ok(msg) = rx.recv() {
         match msg {
-            Msg::Signal(Signal::Captured(cap)) => {
+            Msg::Signal(Signal::Captured(cap)) | Msg::Action(Action::Capture(cap)) => {
+                let mut cap = *cap;
+                // A file manager's Ctrl+C puts only a path on the clipboard,
+                // never the file's bytes — unlike copying an image *element*
+                // in a browser, which offers real image/* data directly. If
+                // that path names a single local image, read it in here so
+                // it renders and thumbnails the same way, instead of sitting
+                // in history as a bare file reference. One shared spot for
+                // both backends, same as everything else past this point.
+                if !cap.flavors.iter().any(|(m, _)| m.starts_with("image/")) {
+                    if let Some((mime, data)) = cap
+                        .flavors
+                        .iter()
+                        .find(|(m, _)| m == "text/uri-list")
+                        .and_then(|(_, data)| clipd_core::detect::image_from_local_file(data))
+                    {
+                        cap.flavors.push((mime, data));
+                    }
+                }
+
                 let inserted = {
                     let mut store = store.lock().unwrap();
-                    let inserted = store.insert(*cap, false);
+                    let inserted = store.insert(cap, false);
                     if matches!(inserted, Ok(Some(_))) {
                         if let Err(e) = store.prune(DEFAULT_MAX_ITEMS) {
                             eprintln!("clipd: prune failed: {e}");
@@ -149,6 +174,17 @@ fn main() -> Result<()> {
                 let wants_xtest_paste = paste && !clipd_platform::is_wayland();
                 let cmd =
                     if wants_xtest_paste { Cmd::Paste { flavors } } else { Cmd::Offer { flavors } };
+                if let Err(e) = backend.send(cmd) {
+                    eprintln!("clipd: backend send failed: {e}");
+                }
+            }
+
+            Msg::Action(Action::OfferFlavors { flavors, paste }) => {
+                let cmd = if paste && !clipd_platform::is_wayland() {
+                    Cmd::Paste { flavors }
+                } else {
+                    Cmd::Offer { flavors }
+                };
                 if let Err(e) = backend.send(cmd) {
                     eprintln!("clipd: backend send failed: {e}");
                 }

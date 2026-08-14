@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! Copyright (C) 2026 Ganesh Bastapure
+//!
 //! X11 backend: XFIXES capture, selection ownership, XTEST paste, XGrabKey hotkey.
 //!
 //! Graduated from `spikes/src/bin/x11_{capture,paste}.rs` after the Phase 0
@@ -58,7 +61,7 @@ const PASSWORD_HINT: &str = "x-kde-passwordManagerHint";
 
 /// Flavors worth storing, in preference order.
 const WANTED: &[&str] = &[
-    "image/png", "image/jpeg", "image/bmp", "text/html", "text/uri-list",
+    "image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp", "text/html", "text/uri-list",
     "text/plain;charset=utf-8", "UTF8_STRING", "STRING", "TEXT",
 ];
 
@@ -143,6 +146,10 @@ struct Backend {
     /// Wayland session: capture and clipboard writes still work through
     /// XWayland, but nothing touching other windows does.
     wayland: bool,
+    /// (type, byte length) of the best-available flavor as of the last
+    /// capture, event-driven or polled — see `poll_check` for why this
+    /// exists at all.
+    last_seen: Option<(Atom, u32)>,
 }
 
 impl Backend {
@@ -196,6 +203,7 @@ impl Backend {
             hotkey_keycode: None,
             last_hotkey: None,
             wayland: crate::is_wayland(),
+            last_seen: None,
         };
 
         if let Some(hk) = hotkey {
@@ -321,6 +329,18 @@ impl Backend {
         let x_fd = self.conn.stream().as_raw_fd();
         let wake_fd = wakee.as_raw_fd();
 
+        // On Wayland (via XWayland), `poll_check` on a fixed cadence — see
+        // its own doc comment for why it stays cheap even for a large
+        // payload, and the loop body below for why *this* backend needs it
+        // at all. X11 sessions never compute a deadline and always block
+        // indefinitely (`next_poll_check` stays `None`, `poll()` gets `-1`):
+        // well-behaved X11 apps reliably re-assert ownership on every copy,
+        // which is the only reason the event-driven design can promise true
+        // zero idle cost there in the first place.
+        const POLL_CHECK_INTERVAL: Duration = Duration::from_millis(1500);
+        let mut next_poll_check =
+            self.wayland.then(|| Instant::now() + POLL_CHECK_INTERVAL);
+
         loop {
             // Drain anything already queued before sleeping.
             while let Some(event) = self.conn.poll_for_event()? {
@@ -334,19 +354,36 @@ impl Backend {
             }
             self.conn.flush()?;
 
-            // Sleep until X has something or a command arrives. No timeout, no
-            // spinning — this is why idle CPU measures 0.000%.
+            // A *fixed deadline*, not "however long poll() naturally takes
+            // to return 0": `n == 0` would mean "nothing at all happened in
+            // the whole window", but any unrelated low-level X traffic
+            // (there is plenty on a running desktop) makes `x_fd` readable
+            // and restarts the wait on the next loop iteration before the
+            // timeout ever naturally elapses — silently starving the safety
+            // net for as long as the connection stays otherwise busy.
+            let timeout_ms = match next_poll_check {
+                Some(deadline) => deadline.saturating_duration_since(Instant::now()).as_millis() as i32,
+                None => -1,
+            };
             let mut fds = [
                 libc::pollfd { fd: x_fd, events: libc::POLLIN, revents: 0 },
                 libc::pollfd { fd: wake_fd, events: libc::POLLIN, revents: 0 },
             ];
-            let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
             if n < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
                 return Err(err.into());
+            }
+            if let Some(deadline) = next_poll_check {
+                if Instant::now() >= deadline {
+                    if let Ok(Some(captured)) = self.poll_check() {
+                        let _ = signals.send(Signal::Captured(Box::new(captured)));
+                    }
+                    next_poll_check = Some(Instant::now() + POLL_CHECK_INTERVAL);
+                }
             }
             if fds[1].revents != 0 {
                 let mut buf = [0u8; 64];
@@ -466,15 +503,22 @@ impl Backend {
 
         // Fetch every flavor we care about, so one copy keeps all its forms.
         let mut flavors = Vec::new();
+        let mut best_seen = None;
         for want in WANTED {
             let Some(atom) = names.get(*want) else { continue };
-            let Fetched::Data(_, data) = self.fetch(*atom)? else { continue };
+            let Fetched::Data(ty, data) = self.fetch(*atom)? else { continue };
             let cap = if want.starts_with("image/") { IMAGE_CAP } else { TEXT_CAP };
             if data.is_empty() || data.len() > cap {
                 continue;
             }
+            // WANTED is priority order, so the first successful flavor is the
+            // one `poll_check`'s cheap probe compares future ticks against —
+            // shared state so a normal event-driven capture and the
+            // safety-net poll never fight over "did this already change".
+            best_seen.get_or_insert((ty, data.len() as u32));
             flavors.push((want.to_string(), data));
         }
+        self.last_seen = best_seen.or(self.last_seen);
 
         if flavors.is_empty() {
             return Ok(None);
@@ -484,6 +528,90 @@ impl Backend {
             source_app: self.source_app(),
             hinted_secret,
         }))
+    }
+
+    /// Cheap safety-net check, run on the poll timeout rather than a real
+    /// event — see `run`'s comment on why this exists at all. Negotiates
+    /// TARGETS (small — a couple hundred bytes at most) and, for the
+    /// best-available flavor, asks only for its *size* rather than its
+    /// content: a zero-length `GetProperty` still returns `bytes_after`, the
+    /// full length, without transferring it. A multi-megabyte screenshot
+    /// sitting on the clipboard for an hour costs a few hundred bytes of
+    /// X traffic every tick here, not a re-transfer of the whole image.
+    ///
+    /// Only actually re-fetches (the real `capture()`, at real cost) when
+    /// that cheap signature changed from `last_seen` — a different type, or
+    /// a different size. Two distinct copies can in principle share both by
+    /// coincidence and be missed; that's an acceptable miss for a safety net
+    /// whose primary path is still the instant, event-driven one.
+    fn poll_check(&mut self) -> Result<Option<Captured>> {
+        let targets_raw = match self.fetch(self.atoms.targets)? {
+            Fetched::Data(_, d) => d,
+            _ => return Ok(None),
+        };
+        let atoms: Vec<Atom> = targets_raw
+            .chunks_exact(4)
+            .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        if atoms.contains(&self.atoms.marker) {
+            return Ok(None); // our own paste
+        }
+
+        let mut names: HashMap<String, Atom> = HashMap::new();
+        for a in &atoms {
+            if let Ok(reply) = self.conn.get_atom_name(*a)?.reply() {
+                names.insert(String::from_utf8_lossy(&reply.name).into_owned(), *a);
+            }
+        }
+
+        let Some(atom) = WANTED.iter().find_map(|want| names.get(*want)) else {
+            return Ok(None);
+        };
+        let Some(signature) = self.probe_size(*atom)? else {
+            return Ok(None);
+        };
+
+        if self.last_seen == Some(signature) {
+            return Ok(None);
+        }
+        self.capture()
+    }
+
+    /// Negotiate `target` and return `(type, byte length)` without fetching
+    /// its content — the same zero-length `GetProperty` trick `fetch` itself
+    /// uses to size a transfer before doing it, stopped there instead of
+    /// going on to read the data.
+    fn probe_size(&self, target: Atom) -> Result<Option<(Atom, u32)>> {
+        self.conn.delete_property(self.win, self.atoms.prop)?;
+        self.conn.convert_selection(
+            self.win,
+            self.atoms.clipboard,
+            target,
+            self.atoms.prop,
+            x11rb::CURRENT_TIME,
+        )?;
+        self.conn.flush()?;
+
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            let Some(event) = self.conn.poll_for_event()? else {
+                std::thread::sleep(Duration::from_micros(200));
+                continue;
+            };
+            // Keep serving while probing, or two managers can deadlock.
+            if let Event::SelectionRequest(req) = &event {
+                self.serve(*req)?;
+                continue;
+            }
+            let Event::SelectionNotify(sn) = event else { continue };
+            if sn.property == x11rb::NONE {
+                return Ok(None);
+            }
+            let probe =
+                self.conn.get_property(false, self.win, self.atoms.prop, AtomEnum::ANY, 0, 0)?.reply()?;
+            return Ok(Some((probe.type_, probe.bytes_after)));
+        }
+        Ok(None)
     }
 
     /// WM_CLASS of the current clipboard owner, for the app blacklist.
@@ -729,63 +857,7 @@ impl Backend {
         // type, not this window's own backend, so gating on it here was
         // right before that change and wrong after it.
         //
-        // The window may not be mapped the instant the UI asks, so give it a
-        // brief window to appear rather than failing on a race.
-        let deadline = Instant::now() + Duration::from_millis(300);
-        loop {
-            if let Some(win) = self.find_popup_window()? {
-                let msg = ClientMessageEvent {
-                    response_type: CLIENT_MESSAGE_EVENT,
-                    format: 32,
-                    sequence: 0,
-                    window: win,
-                    type_: self.atoms.active_window,
-                    data: [2, Time::CURRENT_TIME.into(), 0, 0, 0].into(),
-                };
-                self.conn.send_event(
-                    false,
-                    self.root,
-                    EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
-                    msg,
-                )?;
-                let _ = self.conn.set_input_focus(InputFocus::PARENT, win, Time::CURRENT_TIME);
-                self.conn.flush()?;
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(anyhow!("popup window not mapped"));
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    /// Locate the mapped popup among the root's children by WM_CLASS.
-    ///
-    /// Identifying it this way avoids passing an X window id across the socket
-    /// and keeps the UI free of any windowing-system detail.
-    fn find_popup_window(&self) -> Result<Option<u32>> {
-        let tree = self.conn.query_tree(self.root)?.reply()?;
-        for child in tree.children {
-            let attrs = match self.conn.get_window_attributes(child)?.reply() {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-            if attrs.map_state != x11rb::protocol::xproto::MapState::VIEWABLE {
-                continue;
-            }
-            let Ok(prop) = self
-                .conn
-                .get_property(false, child, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 128)?
-                .reply()
-            else {
-                continue;
-            };
-            let class = String::from_utf8_lossy(&prop.value).to_ascii_lowercase();
-            if class.contains("clipd-desktop") {
-                return Ok(Some(child));
-            }
-        }
-        Ok(None)
+        activate_popup(&self.conn, self.root, self.atoms.active_window)
     }
 
     fn active_window(&self) -> Result<u32> {
@@ -854,20 +926,143 @@ impl Backend {
 
     /// GetInputFocus reports the focused *child*, not the toplevel we asked
     /// for, so a direct comparison gives a false mismatch. Walk up to the root.
-    fn focus_belongs_to(&self, mut focus: u32, target: u32) -> bool {
-        for _ in 0..8 {
-            if focus == target {
-                return true;
-            }
-            match self.conn.query_tree(focus).ok().and_then(|c| c.reply().ok()) {
-                Some(tree) if tree.parent != x11rb::NONE && tree.parent != tree.root => {
-                    focus = tree.parent
-                }
-                _ => break,
-            }
-        }
-        false
+    fn focus_belongs_to(&self, focus: u32, target: u32) -> bool {
+        focus_belongs_to(&self.conn, focus, target)
     }
+}
+
+/// Activate the XWayland popup from the native Wayland backend.
+///
+/// clipd-desktop intentionally runs with `GDK_BACKEND=x11` even in a Wayland
+/// session so the user can move the popup and persist its position. Therefore
+/// its reliable focus mechanism is EWMH/X11 as well. GTK's `set_focus()` may
+/// work on the first map but GNOME rejects later activation attempts as focus
+/// stealing; the pager-style `_NET_ACTIVE_WINDOW` request is the same proven
+/// path used by the X11 backend.
+pub(crate) fn focus_popup_window() -> Result<()> {
+    let (conn, screen_num) = x11rb::connect(None)?;
+    let root = conn.setup().roots[screen_num].root;
+    let active_window = intern(&conn, "_NET_ACTIVE_WINDOW")?;
+    activate_popup(&conn, root, active_window)
+}
+
+fn activate_popup(conn: &RustConnection, root: u32, active_window: Atom) -> Result<()> {
+    // Showing an XWayland surface is asynchronous. Wait until it is viewable,
+    // then activate it once. If the compositor has not committed focus yet,
+    // retry the activation one time after a short settle and verify the result.
+    let map_deadline = Instant::now() + Duration::from_millis(300);
+    let win = loop {
+        if let Some(win) = find_popup_window(conn, root)? {
+            break win;
+        }
+        if Instant::now() >= map_deadline {
+            return Err(anyhow!("popup window not mapped"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    for attempt in 0..2 {
+        let msg = ClientMessageEvent {
+            response_type: CLIENT_MESSAGE_EVENT,
+            format: 32,
+            sequence: 0,
+            window: win,
+            type_: active_window,
+            data: [2, Time::CURRENT_TIME.into(), 0, 0, 0].into(),
+        };
+        conn.send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
+            msg,
+        )?;
+        let _ = conn.set_input_focus(InputFocus::PARENT, win, Time::CURRENT_TIME);
+        conn.flush()?;
+        std::thread::sleep(Duration::from_millis(if attempt == 0 { 20 } else { 40 }));
+
+        let focused = conn.get_input_focus()?.reply()?.focus;
+        if focus_belongs_to(conn, focused, win) {
+            return Ok(());
+        }
+    }
+
+    // Both EWMH attempts asked the window manager to hand over focus and it
+    // didn't. Falling back to a direct SetInputFocus is a genuinely
+    // different mechanism, not a third try at the same one — it bypasses
+    // the window manager's own focus-stealing prevention entirely, at the
+    // cost of not being "the polite way to ask". Worth it here since the
+    // alternative is a popup you opened but can't type into.
+    let _ = conn.set_input_focus(InputFocus::POINTER_ROOT, win, x11rb::CURRENT_TIME);
+    conn.flush()?;
+    std::thread::sleep(Duration::from_millis(30));
+    let focused = conn.get_input_focus()?.reply()?.focus;
+    if focus_belongs_to(conn, focused, win) {
+        return Ok(());
+    }
+
+    Err(anyhow!("GNOME did not give keyboard focus to the popup"))
+}
+
+/// Finds the real popup window by title, via `_NET_CLIENT_LIST` rather than a
+/// raw tree walk.
+///
+/// WM_CLASS alone isn't enough to identify it: GTK/WebKit sets it
+/// application-wide, and clipd-desktop's process also owns a tiny (10x10)
+/// internal helper window — a WebKitGTK implementation detail, not anything
+/// this codebase creates — that inherits the exact same class and is still
+/// VIEWABLE. Matching that one instead of the real popup activates a window
+/// nobody can see or type into, which is what made focus intermittent rather
+/// than reliably broken: whichever of the two got enumerated first won.
+/// `_NET_CLIENT_LIST` is the window manager's own curated list of real,
+/// managed top-level windows — Mutter doesn't put implementation-detail
+/// helper windows in it in the first place, which sidesteps the collision
+/// more robustly than filtering a raw child list after the fact. Title is
+/// still checked on top of that, since it's the one property that actually
+/// differs ("Clipboard", set via tauri.conf.json) and costs nothing to keep.
+fn find_popup_window(conn: &RustConnection, root: u32) -> Result<Option<u32>> {
+    let client_list = intern(conn, "_NET_CLIENT_LIST")?;
+    let net_wm_name = intern(conn, "_NET_WM_NAME")?;
+    let utf8 = intern(conn, "UTF8_STRING")?;
+
+    let windows: Vec<u32> = conn
+        .get_property(false, root, client_list, AtomEnum::WINDOW, 0, 1024)?
+        .reply()?
+        .value32()
+        .map(|iter| iter.collect())
+        .unwrap_or_default();
+
+    for win in windows {
+        let title = conn
+            .get_property(false, win, net_wm_name, utf8, 0, 256)?
+            .reply()
+            .ok()
+            .and_then(|p| String::from_utf8(p.value).ok())
+            .or_else(|| {
+                conn.get_property(false, win, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 256)
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                    .and_then(|p| String::from_utf8(p.value).ok())
+            });
+        if title.as_deref() == Some("Clipboard") {
+            return Ok(Some(win));
+        }
+    }
+    Ok(None)
+}
+
+fn focus_belongs_to(conn: &RustConnection, mut focus: u32, target: u32) -> bool {
+    for _ in 0..8 {
+        if focus == target {
+            return true;
+        }
+        match conn.query_tree(focus).ok().and_then(|cookie| cookie.reply().ok()) {
+            Some(tree) if tree.parent != x11rb::NONE && tree.parent != tree.root => {
+                focus = tree.parent;
+            }
+            _ => break,
+        }
+    }
+    false
 }
 
 enum Flow {

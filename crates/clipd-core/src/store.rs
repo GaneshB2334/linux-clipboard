@@ -1,6 +1,10 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! Copyright (C) 2026 Ganesh Bastapure
+//!
 //! SQLite-backed history. Single writer, owned by the daemon.
 
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -13,6 +17,7 @@ use crate::detect;
 /// keeping the database small enough to stay in page cache.
 const INLINE_LIMIT: usize = 256 * 1024;
 const PREVIEW_CHARS: usize = 200;
+const THUMBNAIL_EDGE: u32 = 320;
 
 /// One clipboard event: every flavor the source app offered, as one unit.
 pub struct Captured {
@@ -26,7 +31,8 @@ impl Captured {
     /// The flavor that decides how this item renders, best first.
     pub fn best(&self) -> Option<&(String, Vec<u8>)> {
         const ORDER: &[&str] = &[
-            "image/png", "image/jpeg", "text/uri-list", "text/html", "UTF8_STRING",
+            "image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp",
+            "text/uri-list", "text/html", "UTF8_STRING",
             "text/plain;charset=utf-8", "STRING", "TEXT",
         ];
         ORDER
@@ -95,7 +101,11 @@ impl Store {
                 pinned       INTEGER NOT NULL DEFAULT 0,
                 favorite     INTEGER NOT NULL DEFAULT 0,
                 sensitive    INTEGER NOT NULL DEFAULT 0,
-                source_app   TEXT
+                source_app   TEXT,
+                image_width  INTEGER,
+                image_height INTEGER,
+                image_format TEXT,
+                thumbnail_path TEXT
             );
 
             -- One row per MIME type, so a single copy keeps all its flavors and
@@ -121,6 +131,24 @@ impl Store {
             );
             "#,
         )?;
+        for (name, ty) in [
+            ("image_width", "INTEGER"),
+            ("image_height", "INTEGER"),
+            ("image_format", "TEXT"),
+            ("thumbnail_path", "TEXT"),
+        ] {
+            let exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('items') WHERE name = ?1)",
+                params![name],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                self.conn.execute(
+                    &format!("ALTER TABLE items ADD COLUMN {name} {ty}"),
+                    [],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -175,6 +203,25 @@ impl Store {
             (None, _) => format!("{} · {}", best_mime, human_size(best_data.len())),
         };
         let byte_size: i64 = cap.flavors.iter().map(|(_, d)| d.len() as i64).sum();
+        let image_info = if kind == Kind::Image {
+            image_metadata(&best_mime, &best_data)
+        } else {
+            None
+        };
+        let thumbnail_path = image_info.as_ref().and_then(|_| {
+            let name = format!("thumb-{}.png", blake3::hash(&best_data).to_hex());
+            let path = self.blobs.join(&name);
+            if !path.exists() {
+                if let Ok(thumbnail) = make_thumbnail(&best_data) {
+                    if std::fs::write(&path, thumbnail).is_err() {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            }
+            Some(name)
+        });
         let now = now_ms();
 
         let tx = self.conn.transaction()?;
@@ -196,8 +243,9 @@ impl Store {
             None => {
                 tx.execute(
                     "INSERT INTO items
-                       (kind, hash, preview, byte_size, created_at, last_used_at, sensitive, source_app)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)",
+                       (kind, hash, preview, byte_size, created_at, last_used_at, sensitive, source_app,
+                        image_width, image_height, image_format, thumbnail_path)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         kind_str(kind),
                         &hash[..],
@@ -206,6 +254,10 @@ impl Store {
                         now,
                         sensitive as i64,
                         cap.source_app,
+                        image_info.as_ref().map(|m| m.0),
+                        image_info.as_ref().map(|m| m.1),
+                        image_info.as_ref().map(|m| m.2.as_str()),
+                        thumbnail_path,
                     ],
                 )?;
                 let id = tx.last_insert_rowid();
@@ -319,6 +371,59 @@ impl Store {
         Ok(out)
     }
 
+    /// Return the generated thumbnail bytes without exposing the history
+    /// directory to the webview.
+    pub fn thumbnail(&self, id: i64) -> Result<Option<Vec<u8>>> {
+        let path: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT thumbnail_path FROM items WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(path.and_then(|name| std::fs::read(self.blobs.join(name)).ok()))
+    }
+
+    /// Create an image-only capture at the requested size. The caller inserts
+    /// it as a new item, so the original remains untouched.
+    pub fn resized_capture(
+        &self,
+        id: i64,
+        width: u32,
+        height: Option<u32>,
+        keep_aspect_ratio: bool,
+    ) -> Result<Option<Captured>> {
+        if width == 0 || width > 16_384 || height.is_some_and(|h| h == 0 || h > 16_384) {
+            anyhow::bail!("image dimensions must be between 1 and 16384 pixels");
+        }
+        let source = self
+            .flavors(id)?
+            .into_iter()
+            .find(|(mime, _)| mime.starts_with("image/"));
+        let Some((_, data)) = source else { return Ok(None) };
+        let image = image::load_from_memory(&data).context("decoding image")?;
+        let target_height = if keep_aspect_ratio || height.is_none() {
+            ((image.height() as f64) * (width as f64 / image.width() as f64)).round() as u32
+        } else {
+            height.unwrap()
+        };
+        let resized = image.resize_exact(width, target_height.max(1), image::imageops::FilterType::Lanczos3);
+        let mut output = Cursor::new(Vec::new());
+        resized.write_to(&mut output, image::ImageFormat::Png)?;
+        Ok(Some(Captured {
+            flavors: vec![("image/png".into(), output.into_inner())],
+            source_app: None,
+            hinted_secret: false,
+        }))
+    }
+
+    /// Mark a transient clipboard offer as our current head so a Wayland
+    /// watcher does not write the same offer back into history.
+    pub fn mark_head(&mut self, cap: &Captured) {
+        self.head_hash = Some(hash_of(cap));
+    }
+
     /// Mark an item as just pasted, so it returns to the head.
     pub fn touch(&mut self, id: i64) -> Result<()> {
         self.conn.execute(
@@ -404,10 +509,16 @@ impl Store {
         let live: std::collections::HashSet<String> = stmt
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<Result<_, _>>()?;
+        let mut thumbnail_stmt = self
+            .conn
+            .prepare("SELECT DISTINCT thumbnail_path FROM items WHERE thumbnail_path IS NOT NULL")?;
+        let thumbnails: std::collections::HashSet<String> = thumbnail_stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<_, _>>()?;
         for entry in std::fs::read_dir(&self.blobs)? {
             let entry = entry?;
             if let Some(name) = entry.file_name().to_str() {
-                if !live.contains(name) {
+                if !live.contains(name) && !thumbnails.contains(name) {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
@@ -422,7 +533,8 @@ impl Store {
 
 const SELECT_ITEM: &str = "SELECT i.id, i.kind, i.preview, i.byte_size, i.created_at,
         i.last_used_at, i.use_count, i.pinned, i.favorite, i.sensitive, i.source_app,
-        (SELECT GROUP_CONCAT(mime, char(31)) FROM flavors WHERE item_id = i.id)
+        (SELECT GROUP_CONCAT(mime, char(31)) FROM flavors WHERE item_id = i.id),
+        i.image_width, i.image_height, i.image_format, i.thumbnail_path IS NOT NULL
    FROM items i";
 
 fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
@@ -442,7 +554,24 @@ fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
         mimes: mimes
             .map(|s| s.split('\u{1f}').map(str::to_string).collect())
             .unwrap_or_default(),
+        image_width: r.get(12)?,
+        image_height: r.get(13)?,
+        image_format: r.get(14)?,
+        has_thumbnail: r.get::<_, i64>(15)? != 0,
     })
+}
+
+fn image_metadata(mime: &str, data: &[u8]) -> Option<(u32, u32, String)> {
+    let image = image::load_from_memory(data).ok()?;
+    Some((image.width(), image.height(), mime.to_string()))
+}
+
+fn make_thumbnail(data: &[u8]) -> Result<Vec<u8>> {
+    let image = image::load_from_memory(data)?;
+    let thumbnail = image.thumbnail(THUMBNAIL_EDGE, THUMBNAIL_EDGE);
+    let mut output = Cursor::new(Vec::new());
+    thumbnail.write_to(&mut output, image::ImageFormat::Png)?;
+    Ok(output.into_inner())
 }
 
 /// Identity of a copy, for dedupe and head suppression.

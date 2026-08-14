@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! Copyright (C) 2026 Ganesh Bastapure
+//!
 //! Unix-socket server: request/response plus a push stream of events.
 //!
 //! Reads that only touch SQLite are answered on the connection thread. Anything
@@ -11,13 +14,17 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use clipd_core::Store;
+use clipd_core::{Captured, Store};
 use clipd_ipc::{encode, Event, Request, Response};
 
 /// Work that must run on the thread owning the X11 connection.
 pub enum Action {
     /// Put an item on the clipboard, optionally injecting a paste.
     Offer { id: i64, paste: bool, plain: bool },
+    /// Put transient flavors on the clipboard, optionally injecting paste.
+    OfferFlavors { flavors: Vec<(String, Vec<u8>)>, paste: bool },
+    /// A capture delivered by the wl-paste watcher.
+    Capture(Box<Captured>),
     /// Snapshot the focused window before the popup takes focus.
     RememberFocus,
     /// Hand keyboard focus to the popup, which cannot do it for itself.
@@ -162,6 +169,71 @@ fn handle(
 
         Request::Copy { id } => {
             tx.send(Msg::Action(Action::Offer { id, paste: false, plain: false })).ok();
+            Response::Ok
+        }
+
+        Request::Capture { flavors, hinted_secret } => {
+            use base64::Engine as _;
+            let decoded = flavors
+                .into_iter()
+                .filter_map(|flavor| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(flavor.data)
+                        .ok()
+                        .map(|data| (flavor.mime, data))
+                })
+                .collect();
+            tx.send(Msg::Action(Action::Capture(Box::new(Captured {
+                flavors: decoded,
+                source_app: None,
+                hinted_secret,
+            }))))
+            .ok();
+            Response::Ok
+        }
+
+        Request::Thumbnail { id } => {
+            use base64::Engine as _;
+            let data = store.lock().unwrap().thumbnail(id)?;
+            let encoded = data.map(|bytes| {
+                format!(
+                    "data:image/png;base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(bytes)
+                )
+            });
+            Response::Thumbnail { data: encoded.unwrap_or_default() }
+        }
+
+        Request::ResizeCopy { id, width, height, keep_aspect_ratio } => {
+            let item = {
+                let mut store = store.lock().unwrap();
+                let Some(captured) = store.resized_capture(id, width, height, keep_aspect_ratio)? else {
+                    return Ok(Some(Response::Error { message: "selected item is not an image".into() }));
+                };
+                let item = store.insert(captured, false)?;
+                if let Some(item) = &item {
+                    hub.broadcast(&Event::Added { item: item.clone() });
+                }
+                item
+            };
+            if let Some(item) = item {
+                tx.send(Msg::Action(Action::Offer { id: item.id, paste: false, plain: false })).ok();
+            }
+            Response::Ok
+        }
+
+        Request::SetText { text, paste } => {
+            let captured = Captured {
+                flavors: vec![("UTF8_STRING".into(), text.into_bytes())],
+                source_app: None,
+                hinted_secret: false,
+            };
+            store.lock().unwrap().mark_head(&captured);
+            tx.send(Msg::Action(Action::OfferFlavors {
+                flavors: captured.flavors,
+                paste,
+            }))
+            .ok();
             Response::Ok
         }
 

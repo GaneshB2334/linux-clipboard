@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! Copyright (C) 2026 Ganesh Bastapure
+//!
 //! Tiny CLI for the daemon socket.
 //!
 //! On X11 the daemon grabs the hotkey itself, so this is mostly a debugging and
@@ -8,6 +11,8 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+
+use base64::Engine as _;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -41,6 +46,10 @@ fn main() {
             // Streams events until killed — the quickest way to see whether the
             // hotkey grab, capture and broadcast paths are all live.
             watch();
+            return;
+        }
+        Some("capture-wayland") => {
+            capture_wayland();
             return;
         }
         Some("help" | "-h" | "--help") => {
@@ -141,4 +150,62 @@ usage: clipctl <command>
   copy <id>           put an item on the clipboard without pasting
   delete <id>         remove an item
   watch               stream events (captures, hotkey, deletions)
+  capture-wayland     internal wl-paste watcher helper
   ping                check the daemon is alive";
+
+fn capture_wayland() {
+    let output = match std::process::Command::new("wl-paste")
+        .args(["--list-types"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return,
+    };
+
+    let types = String::from_utf8_lossy(&output.stdout);
+    let wanted = [
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+        "image/bmp",
+        "text/html",
+        "text/uri-list",
+        "text/plain;charset=utf-8",
+        "text/plain",
+    ];
+    let mut flavors = Vec::new();
+    for mime in wanted {
+        if !types.lines().any(|line| line.trim() == mime) {
+            continue;
+        }
+        let Ok(data) = std::process::Command::new("wl-paste")
+            .args(["--no-newline", "--type", mime])
+            .output()
+        else {
+            continue;
+        };
+        if !data.status.success() || data.stdout.is_empty() {
+            continue;
+        }
+        flavors.push(serde_json::json!({
+            "mime": mime,
+            "data": base64::engine::general_purpose::STANDARD.encode(data.stdout),
+        }));
+    }
+
+    if flavors.is_empty() {
+        return;
+    }
+    let hinted_secret = types.lines().any(|line| {
+        line.trim() == "x-kde-passwordManagerHint"
+    });
+    let request = serde_json::json!({
+        "op": "capture",
+        "flavors": flavors,
+        "hinted_secret": hinted_secret,
+    });
+    let path = clipd_ipc::socket_path();
+    let Ok(mut stream) = UnixStream::connect(path) else { return };
+    let _ = writeln!(stream, "{request}").and_then(|_| stream.flush());
+}

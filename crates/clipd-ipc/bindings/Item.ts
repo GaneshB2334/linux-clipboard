@@ -18,4 +18,20 @@ sensitive: boolean, source_app: string | null,
 /**
  * Every MIME type captured for this one copy, e.g. `["text/html", "UTF8_STRING"]`.
  */
-mimes: Array<string>, };
+mimes: Array<string>, 
+/**
+ * Pixel width for image entries.
+ */
+image_width: number | null, 
+/**
+ * Pixel height for image entries.
+ */
+image_height: number | null, 
+/**
+ * Original image MIME type when the item is an image.
+ */
+image_format: string | null, 
+/**
+ * Whether a lazy-loadable thumbnail exists for this item.
+ */
+has_thumbnail: boolean, };

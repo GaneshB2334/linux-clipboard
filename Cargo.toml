@@ -26,7 +26,7 @@ default-members = [
 [workspace.package]
 edition = "2021"
 rust-version = "1.85"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 clipd-ipc = { path = "crates/clipd-ipc" }
@@ -36,6 +36,8 @@ clipd-platform = { path = "crates/clipd-platform" }
 x11rb = { version = "0.13", features = ["xfixes", "xtest", "xinput"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 blake3 = "1.8"
+base64 = "0.22"
+image = { version = "0.25", default-features = true, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"

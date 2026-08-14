@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! Copyright (C) 2026 Ganesh Bastapure
+//!
 //! Client for the clipd socket.
 //!
 //! Requests open a short-lived connection: a Unix-socket round trip is tens of

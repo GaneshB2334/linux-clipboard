@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Ganesh Bastapure
+
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { Item } from "../../../crates/clipd-ipc/bindings/Item";
@@ -8,7 +11,11 @@ export type { Item, ClipEvent };
 export const api = {
   recent: (limit = 300) => invoke<Item[]>("recent", { limit }),
   search: (query: string, limit = 300) => invoke<Item[]>("search", { query, limit }),
+  thumbnail: (id: number) => invoke<string>("thumbnail", { id }),
   paste: (id: number, plain = false) => invoke<void>("paste", { id, plain }),
+  pasteText: (text: string) => invoke<void>("paste_text", { text }),
+  resizeCopy: (id: number, width: number, height?: number) =>
+    invoke<void>("resize_copy", { id, width, height }),
   copy: (id: number) => invoke<void>("copy_item", { id }),
   remove: (id: number) => invoke<void>("delete", { id }),
   setPinned: (id: number, pinned: boolean) => invoke<void>("set_pinned", { id, pinned }),

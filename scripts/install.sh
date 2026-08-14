@@ -1,220 +1,152 @@
 #!/usr/bin/env bash
-# Install clipd for the current user.
+# Install the latest clipd Debian release for the current user/session.
 #
-#   install.sh              install binaries, GNOME extension, autostart
-#   install.sh --uninstall  remove all of the above
-#   install.sh --status     show what is installed and running
-#
-# Everything lands under $HOME. Nothing here needs sudo, and nothing writes to
-# a system-wide config. The one gsettings key touched is the user's own
-# `enabled-extensions` list, and only via a read-modify-verify cycle that
-# restores the original value if the result does not check out — see the
-# comment at enable_extension() for why that care is warranted.
+# curl -fsSL https://raw.githubusercontent.com/GaneshB2334/linux-clipboard/main/scripts/install.sh | bash
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN_DIR="$HOME/.local/bin"
-EXT_UUID="clipd@clipd.dev"
-EXT_DIR="$HOME/.local/share/gnome-shell/extensions/$EXT_UUID"
-AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/clipd.desktop"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/clipd"
-BINARIES=(clipd clipd-desktop clipctl)
+REPO="${CLIPD_REPO:-GaneshB2334/linux-clipboard}"
+RELEASE_VERSION=""
+DRY_RUN=0
+NO_LAUNCH=0
 
-say()  { printf '  %s\n' "$*"; }
-step() { printf '\n== %s\n' "$*"; }
+if [[ -t 1 ]]; then
+    RESET=$'\033[0m'; BOLD=$'\033[1m'; BLUE=$'\033[1;34m'; GREEN=$'\033[1;32m'; YELLOW=$'\033[1;33m'; RED=$'\033[1;31m'; CYAN=$'\033[1;36m'
+else
+    RESET=""; BOLD=""; BLUE=""; GREEN=""; YELLOW=""; RED=""; CYAN=""
+fi
 
-is_gnome() {
-    [[ "${XDG_CURRENT_DESKTOP:-}" == *GNOME* ]]
-}
+info() { printf '%s•%s %s\n' "$BLUE" "$RESET" "$*"; }
+ok() { printf '%s✓%s %s\n' "$GREEN" "$RESET" "$*"; }
+warn() { printf '%s!%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+die() { printf '%s✗%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
 
-# ---------------------------------------------------------------- status ----
+usage() {
+    cat <<'EOF'
+Usage: install.sh [options]
 
-status() {
-    step "binaries"
-    for b in "${BINARIES[@]}"; do
-        if [[ -x "$BIN_DIR/$b" ]]; then say "$b: $BIN_DIR/$b"; else say "$b: not installed"; fi
-    done
-
-    step "processes"
-    pgrep -x clipd         >/dev/null && say "clipd: running"         || say "clipd: not running"
-    pgrep -x clipd-desktop >/dev/null && say "clipd-desktop: running" || say "clipd-desktop: not running"
-
-    step "GNOME Shell extension (Wayland auto-paste)"
-    if [[ -d "$EXT_DIR" ]]; then
-        say "installed: $EXT_DIR"
-        if gdbus call --session --dest org.freedesktop.DBus \
-             --object-path /org/freedesktop/DBus \
-             --method org.freedesktop.DBus.NameHasOwner "dev.clipd.PasteHelper" 2>/dev/null \
-             | grep -q true; then
-            say "active: yes — auto-paste is working"
-        else
-            say "active: NO — log out and back in to load it"
-        fi
-    else
-        say "not installed"
-    fi
-
-    step "autostart"
-    [[ -f "$AUTOSTART" ]] && say "enabled: $AUTOSTART" || say "not enabled"
-
-    step "hotkey"
-    say "in-process grab: ${CONFIG_DIR}/hotkey ($(cat "$CONFIG_DIR/hotkey" 2>/dev/null || echo 'ctrl+alt+c (default)'))"
-    say "Super+V must be added in Settings > Keyboard > Custom Shortcuts —"
-    say "GNOME reserves every Super+key combination and will not share it."
-}
-
-# ------------------------------------------------------------- uninstall ----
-
-uninstall() {
-    step "stopping"
-    pkill -x clipd-desktop 2>/dev/null || true
-    pkill -x clipd 2>/dev/null || true
-    say "stopped"
-
-    step "removing"
-    rm -f "$AUTOSTART";                    say "autostart entry"
-    for b in "${BINARIES[@]}"; do rm -f "$BIN_DIR/$b"; done; say "binaries"
-
-    if [[ -d "$EXT_DIR" ]]; then
-        gnome-extensions disable "$EXT_UUID" 2>/dev/null || true
-        rm -rf "$EXT_DIR"
-        say "GNOME extension"
-    fi
-
-    printf '\nclipd removed. Your clipboard history is still at %s\n' \
-        "${XDG_DATA_HOME:-$HOME/.local/share}/clipd"
-    printf 'Delete it with: rm -rf %s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/clipd"
-    printf 'If you added a Super+V shortcut in Settings, remove it there too.\n'
-}
-
-# --------------------------------------------------------------- install ----
-
-install_binaries() {
-    step "binaries -> $BIN_DIR"
-    for b in "${BINARIES[@]}"; do
-        [[ -x "$ROOT/target/release/$b" ]] || {
-            echo "missing $ROOT/target/release/$b — run: cargo build --release" >&2
-            exit 1
-        }
-    done
-    mkdir -p "$BIN_DIR"
-    for b in "${BINARIES[@]}"; do
-        install -m 755 "$ROOT/target/release/$b" "$BIN_DIR/$b"
-        say "$b"
-    done
-    case ":$PATH:" in
-        *":$BIN_DIR:"*) ;;
-        *) say "note: $BIN_DIR is not on your PATH (only matters for running clipctl by hand)" ;;
-    esac
-}
-
-# Add the extension to the user's enabled list.
-#
-# `gnome-extensions enable` cannot be used for a *newly installed* extension:
-# GNOME Shell only learns about it on session start, so until then the CLI
-# reports "doesn't exist". Writing the gsettings key directly is the only way
-# to have it enabled on next login — but this project has already had a
-# malformed write to a neighbouring key segfault gsd-media-keys and take out
-# every media shortcut, so the value is built with a real parser and verified
-# afterwards, restoring the original if anything looks wrong.
-enable_extension() {
-    local key="org.gnome.shell enabled-extensions"
-    local backup new after
-    backup="$(gsettings get $key)"
-
-    new="$(python3 - "$backup" "$EXT_UUID" <<'PY'
-import ast, sys
-cur, uuid = sys.argv[1].strip(), sys.argv[2]
-items = ast.literal_eval(cur) if cur.startswith('[') else []
-items = [i for i in items if isinstance(i, str) and i]
-if uuid not in items:
-    items.append(uuid)
-print('[' + ', '.join(repr(i) for i in items) + ']')
-PY
-)"
-
-    gsettings set $key "$new"
-    after="$(gsettings get $key)"
-
-    if ! python3 - "$backup" "$after" "$EXT_UUID" <<'PY'
-import ast, sys
-
-def parse(raw):
-    raw = raw.strip()
-    return list(ast.literal_eval(raw)) if raw.startswith('[') else []
-
-old, new, uuid = parse(sys.argv[1]), parse(sys.argv[2]), sys.argv[3]
-missing = [x for x in old if x not in new]
-assert not missing, f"lost entries: {missing}"
-assert uuid in new, "uuid missing"
-bad = [x for x in new if not isinstance(x, str) or not x or x.startswith('@')]
-assert not bad, f"malformed entries: {bad}"
-PY
-    then
-        gsettings set $key "$backup"
-        echo "extension enable failed verification; original value restored" >&2
-        return 1
-    fi
-    say "enabled (takes effect after logout)"
-}
-
-install_extension() {
-    if ! is_gnome; then
-        step "GNOME Shell extension"
-        say "skipped — not a GNOME session (XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-unset})"
-        return
-    fi
-    step "GNOME Shell extension -> $EXT_DIR"
-    rm -rf "$EXT_DIR"
-    mkdir -p "$(dirname "$EXT_DIR")"
-    cp -r "$ROOT/extension/$EXT_UUID" "$EXT_DIR"
-    say "installed"
-    enable_extension || true
-}
-
-install_autostart() {
-    step "autostart"
-    "$ROOT/scripts/install-autostart.sh" >/dev/null
-    say "$AUTOSTART"
-}
-
-main() {
-    case "${1:-install}" in
-        --status)    status; exit 0 ;;
-        --uninstall) uninstall; exit 0 ;;
-        install)     ;;
-        *) echo "unknown argument: $1" >&2; exit 1 ;;
-    esac
-
-    install_binaries
-    install_extension
-    install_autostart
-
-    mkdir -p "$CONFIG_DIR"
-    [[ -f "$CONFIG_DIR/hotkey" ]] || echo "ctrl+alt+c" > "$CONFIG_DIR/hotkey"
-
-    cat <<EOF
-
-clipd is installed.
-
-Next steps:
-
-  1. Log out and back in.
-     Required on Wayland for the paste extension to load, and it starts clipd
-     automatically. Without it, selecting an item copies but does not paste.
-
-  2. Optional — bind Super+V:
-     Settings > Keyboard > View and Customize Shortcuts > Custom Shortcuts > +
-       Name:     Clipboard
-       Command:  '$BIN_DIR/clipctl' toggle
-       Shortcut: Super+V
-     GNOME reserves every Super+key combination, so this is the only way to
-     use one. $(cat "$CONFIG_DIR/hotkey") works out of the box without this.
-
-Check anything: $0 --status
-Remove it:     $0 --uninstall
+  --version VERSION  install a specific release tag
+  --dry-run          show what would happen without installing
+  --no-launch        install without starting clipd immediately
+  --status           show installed package status
+  --uninstall        remove clipd but keep clipboard history
 EOF
 }
 
-main "$@"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --version) RELEASE_VERSION="${2:-}"; [[ -n "$RELEASE_VERSION" ]] || die "--version needs a value"; shift 2 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --no-launch) NO_LAUNCH=1; shift ;;
+        --status) dpkg-query -W -f='${Status} ${Version}\n' clipd 2>/dev/null || echo "clipd is not installed"; exit 0 ;;
+        --uninstall) sudo apt-get remove -y clipd; exit $? ;;
+        --help|-h) usage; exit 0 ;;
+        *) die "unknown option: $1" ;;
+    esac
+done
+
+[[ -f /etc/os-release ]] || die "cannot detect the distribution"
+# shellcheck disable=SC1091
+. /etc/os-release
+case "${ID:-}:${ID_LIKE:-}" in
+    ubuntu:*|debian:*|*:*debian*|*:*ubuntu*) ;;
+    *) die "this installer currently supports Debian and Ubuntu. Use a package from GitHub Releases on another distribution." ;;
+esac
+
+case "$(uname -m)" in
+    x86_64|amd64) ARCH="amd64" ;;
+    aarch64|arm64) ARCH="arm64" ;;
+    *) die "unsupported architecture: $(uname -m)" ;;
+esac
+
+if [[ -n "${WAYLAND_DISPLAY:-}" || "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+    SESSION="Wayland"
+    SESSION_PACKAGES=(wl-clipboard)
+else
+    SESSION="X11"
+    SESSION_PACKAGES=()
+fi
+
+command -v curl >/dev/null 2>&1 || {
+    [[ "$DRY_RUN" == 1 ]] || { sudo apt-get update; sudo apt-get install -y curl ca-certificates python3; }
+}
+command -v python3 >/dev/null 2>&1 || {
+    [[ "$DRY_RUN" == 1 ]] || { sudo apt-get update; sudo apt-get install -y python3; }
+}
+
+API="https://api.github.com/repos/$REPO/releases"
+if [[ -n "$RELEASE_VERSION" ]]; then
+    RELEASE_VERSION="${RELEASE_VERSION#v}"
+    API="$API/tags/v$RELEASE_VERSION"
+else
+    API="$API/latest"
+fi
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+JSON="$TMP/release.json"
+
+info "Detected ${ID:-Debian} ${ARCH} on ${SESSION}"
+info "Release source: https://github.com/$REPO/releases"
+
+if [[ "$DRY_RUN" == 1 ]]; then
+    info "Would fetch: $API"
+    info "Would install: clipd_${RELEASE_VERSION:-latest}_${ARCH}.deb"
+    ((${#SESSION_PACKAGES[@]})) && info "Would install session tools: ${SESSION_PACKAGES[*]}"
+    exit 0
+fi
+
+curl -fsSL --retry 3 -o "$JSON" "$API" || die "could not fetch release metadata"
+
+ASSETS="$(python3 - "$JSON" "$ARCH" <<'PY'
+import json, sys
+release = json.load(open(sys.argv[1], encoding="utf-8"))
+arch = sys.argv[2]
+assets = {asset["name"]: asset["browser_download_url"] for asset in release.get("assets", [])}
+deb = next((name for name in assets if name.startswith("clipd_") and name.endswith(f"_{arch}.deb")), None)
+checksums = next((name for name in assets if name == "SHA256SUMS"), None)
+if not deb or not checksums:
+    raise SystemExit("release is missing the matching .deb or SHA256SUMS asset")
+print(deb)
+print(assets[deb])
+print(assets[checksums])
+PY
+)" || die "release does not contain a $ARCH .deb and SHA256SUMS"
+
+DEB_NAME="$(sed -n '1p' <<<"$ASSETS")"
+DEB_URL="$(sed -n '2p' <<<"$ASSETS")"
+SUM_URL="$(sed -n '3p' <<<"$ASSETS")"
+DEB="$TMP/$DEB_NAME"
+SUMS="$TMP/SHA256SUMS"
+
+info "Downloading $DEB_NAME"
+curl -fL --retry 3 --progress-bar -o "$DEB" "$DEB_URL"
+curl -fsSL --retry 3 -o "$SUMS" "$SUM_URL"
+
+HASH="$(awk -v file="$DEB_NAME" '$2 == file || $2 == "*" file { print $1; exit }' "$SUMS")"
+[[ "$HASH" =~ ^[0-9a-fA-F]{64}$ ]] || die "no SHA-256 entry found for $DEB_NAME"
+printf '%s  %s\n' "$HASH" "$DEB" | sha256sum -c - >/dev/null || die "checksum verification failed"
+ok "Verified SHA-256 checksum"
+
+sudo apt-get update
+if ((${#SESSION_PACKAGES[@]})); then
+    info "Installing Wayland clipboard support: ${SESSION_PACKAGES[*]}"
+    sudo apt-get install -y "${SESSION_PACKAGES[@]}"
+fi
+sudo apt install -y "$DEB"
+ok "clipd package installed"
+
+if [[ "$NO_LAUNCH" == 0 ]]; then
+    pkill -x clipd-desktop 2>/dev/null || true
+    pkill -x clipd 2>/dev/null || true
+    nohup /usr/bin/clipd-session >/dev/null 2>&1 < /dev/null &
+    disown || true
+    ok "clipd started"
+fi
+
+printf '\n%s%sInstallation complete%s\n' "$BOLD" "$GREEN" "$RESET"
+printf '  Session: %s\n' "$SESSION"
+printf '  Default shortcut: %sCtrl+Alt+C%s\n' "$CYAN" "$RESET"
+printf '  History: ~/.local/share/clipd\n'
+printf '  Status:  %s--status%s\n' "$CYAN" "$RESET"
+printf '\n%sSuper+V is optional:%s add /usr/bin/clipctl toggle in GNOME Custom Shortcuts.\n' "$YELLOW" "$RESET"

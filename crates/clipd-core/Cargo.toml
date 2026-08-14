@@ -8,6 +8,7 @@ license.workspace = true
 clipd-ipc.workspace = true
 rusqlite.workspace = true
 blake3.workspace = true
+image.workspace = true
 anyhow.workspace = true
 
 [dev-dependencies]

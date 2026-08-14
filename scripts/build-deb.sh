@@ -15,7 +15,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION="$(grep -m1 '^version' "$ROOT/crates/clipd/Cargo.toml" | cut -d'"' -f2)"
-ARCH="amd64"
+case "${CLIPD_ARCH:-$(uname -m)}" in
+    x86_64|amd64) ARCH="amd64" ;;
+    aarch64|arm64) ARCH="arm64" ;;
+    *) echo "unsupported architecture: ${CLIPD_ARCH:-$(uname -m)}" >&2; exit 1 ;;
+esac
 PKG="clipd_${VERSION}_${ARCH}"
 BUILD="$ROOT/target/deb/$PKG"
 OUT="$ROOT/dist"
@@ -212,8 +216,8 @@ Version: ${VERSION}
 Section: utils
 Priority: optional
 Architecture: ${ARCH}
-Depends: libwebkit2gtk-4.1-0, libgtk-3-0t64 | libgtk-3-0, libjavascriptcoregtk-4.1-0, python3
-Recommends: gnome-shell
+Depends: libwebkit2gtk-4.1-0, libgtk-3-0t64 | libgtk-3-0, libjavascriptcoregtk-4.1-0, python3, acl
+Recommends: gnome-shell, wl-clipboard
 Installed-Size: ${INSTALLED_KB}
 Maintainer: Ganesh Bastapure <GaneshB2334@users.noreply.github.com>
 Homepage: https://github.com/GaneshB2334/linux-clipboard
@@ -228,8 +232,9 @@ Description: Clipboard history manager with an instant popup
  flagged by password managers are dropped rather than stored, and never enter
  the search index.
  .
- Works on X11 out of the box. On Wayland it also ships a small GNOME Shell
- extension so it can paste for you without asking for remote-desktop access.
+ Works immediately after install, X11 or Wayland, no logout required: paste
+ is injected through a kernel-level virtual keyboard (the same mechanism a
+ second physical keyboard would use), not a compositor-specific extension.
 CONTROL
 
 cat > "$BUILD/DEBIAN/postinst" <<'POSTINST'
@@ -240,16 +245,48 @@ if [ -x /usr/bin/gtk-update-icon-cache ]; then
     gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true
 fi
 
-GREEN='\033[1;32m'; CYAN='\033[1;36m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; RESET='\033[0m'
+# uinput permission for Wayland auto-paste — see crates/clipd-platform/src/
+# uinput.rs for the full "why". Two layers, matching the pattern used by
+# github.com/gustavosett/Windows-11-Clipboard-History-For-Linux for the same
+# problem:
+#   1. A udev rule so every *future* boot's fresh /dev/uinput node already
+#      has the right permissions.
+#   2. setfacl on the *current* node so this works immediately, this
+#      session — an ACL grant on an existing file is checked at open() time,
+#      unlike group membership, which an already-running session only picks
+#      up at its own next login.
+# Best-effort throughout: if the uinput module is unavailable (a locked-down
+# kernel, a container), clipd falls back to the GNOME Shell extension.
+if [ -e /dev/uinput ] || modprobe uinput >/dev/null 2>&1; then
+    mkdir -p /etc/udev/rules.d
+    cat > /etc/udev/rules.d/99-clipd-uinput.rules <<'UDEV'
+# clipd: let the logged-in user create a virtual keyboard for Wayland
+# auto-paste, without needing root. Installed by clipd's postinst.
+ACTION=="add", SUBSYSTEM=="misc", KERNEL=="uinput", OPTIONS+="static_node=uinput"
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", TAG+="uaccess"
+UDEV
+
+    mkdir -p /etc/modules-load.d
+    echo "uinput" > /etc/modules-load.d/clipd.conf
+
+    udevadm control --reload-rules >/dev/null 2>&1 || true
+    udevadm trigger --subsystem-match=misc --attr-match=name=uinput >/dev/null 2>&1 || true
+
+    # dpkg -i is normally run via sudo, which sets SUDO_USER to the real
+    # account; logname is the fallback for anything else that still leaves
+    # an attributable login (su, a root shell on the console).
+    TARGET_USER="${SUDO_USER:-$(logname 2>/dev/null || true)}"
+    if [ -n "$TARGET_USER" ] && [ -e /dev/uinput ] && command -v setfacl >/dev/null 2>&1; then
+        setfacl -m "u:${TARGET_USER}:rw" /dev/uinput 2>/dev/null || true
+    fi
+fi
+
+GREEN='\033[1;32m'; CYAN='\033[1;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
 printf '\n'
-printf "${BOLD}clipd is installed.${RESET}\n"
-printf "${YELLOW}➜ One thing left: log out and back in.${RESET}\n"
-printf "  (That's a GNOME requirement, not clipd's — a freshly installed\n"
-printf "   Shell extension only loads at session start.)\n"
+printf "${BOLD}clipd is installed and ready${RESET} — no logout needed.\n"
 printf '\n'
-printf "${GREEN}After that, press ${CYAN}Ctrl+Alt+C${GREEN} to open it. No setup needed${RESET}\n"
-printf "${GREEN}— it works the same on X11 and Wayland.${RESET}\n"
+printf "Press ${CYAN}Ctrl+Alt+C${RESET} to open it. ${GREEN}Works the same on X11 and Wayland.${RESET}\n"
 printf '\n'
 printf "Want ${CYAN}Super+V${RESET} instead? GNOME reserves that combo for itself, so it's a\n"
 printf "manual step: Settings > Keyboard > Keyboard Shortcuts, scroll to the\n"
@@ -266,6 +303,9 @@ set -e
 if [ "$1" = "purge" ]; then
     echo "clipd removed. Clipboard history is kept per-user at"
     echo "~/.local/share/clipd — delete it with: rm -rf ~/.local/share/clipd"
+
+    rm -f /etc/udev/rules.d/99-clipd-uinput.rules /etc/modules-load.d/clipd.conf
+    udevadm control --reload-rules >/dev/null 2>&1 || true
 fi
 
 if [ -x /usr/bin/gtk-update-icon-cache ]; then
@@ -280,8 +320,10 @@ chmod 755 "$BUILD/DEBIAN/postrm"
 mkdir -p "$OUT"
 # Root-owned files inside the archive without needing root to build.
 dpkg-deb --root-owner-group --build "$BUILD" "$OUT/$PKG.deb" >/dev/null
+sha256sum "$OUT/$PKG.deb" > "$OUT/SHA256SUMS"
 
 echo "built $OUT/$PKG.deb ($(du -h "$OUT/$PKG.deb" | cut -f1))"
+echo "checksum written to $OUT/SHA256SUMS"
 echo
 dpkg-deb --info "$OUT/$PKG.deb" | sed -n '2,12p'
 echo "--- contents ---"

@@ -61,7 +61,7 @@ at a time, losing a URL because you copied a command right after it.
 So I built **clipd**: an open-source clipboard manager for Ubuntu and Debian with
 the popup Windows should have shipped on Linux years ago.
 
-**[→ Download the .deb](https://github.com/GaneshB2334/linux-clipboard/releases/latest/download/clipd_0.1.0_amd64.deb)**  ·  **[Source on GitHub](https://github.com/GaneshB2334/linux-clipboard)**
+**[→ Download the .deb](https://github.com/GaneshB2334/linux-clipboard/releases/download/v0.1.0/clipd_0.1.0_amd64.deb)**  ·  **[Source on GitHub](https://github.com/GaneshB2334/linux-clipboard)**
 
 ## What it does
 
@@ -170,7 +170,7 @@ It's version 0.1.0. It works, and I use it daily.
 
 ## Try it
 
-**[Download the .deb](https://github.com/GaneshB2334/linux-clipboard/releases/latest/download/clipd_0.1.0_amd64.deb)** — free and open source (MIT).
+**[Download the .deb](https://github.com/GaneshB2334/linux-clipboard/releases/download/v0.1.0/clipd_0.1.0_amd64.deb)** — free and open source (GPL-3.0).
 
 The [source is on GitHub](https://github.com/GaneshB2334/linux-clipboard), issues
 and pull requests welcome. If you build something with it or hit a bug, I'd like

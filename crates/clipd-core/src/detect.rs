@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! Copyright (C) 2026 Ganesh Bastapure
+//!
 //! Content classification and secret detection.
 //!
 //! Deliberately regex-free: these run on every copy, and hand-rolled scanners
@@ -33,6 +36,85 @@ pub fn kind_of(mime: &str, data: &[u8]) -> Kind {
         return Kind::Code;
     }
     Kind::Text
+}
+
+/// Payloads at or above this are skipped rather than read into memory —
+/// matches the X11 backend's own image size cap, for the same reason.
+const MAX_FILE_IMAGE: u64 = 50 * 1024 * 1024;
+
+/// A `text/uri-list` copy (Ctrl+C on a file in a file manager) carries only a
+/// path, never the file's bytes — unlike copying an image *element* in a
+/// browser, which puts real `image/*` data on the clipboard directly. This
+/// reads the file when the list names exactly one local image, so it renders
+/// and thumbnails the same way a browser-copied image does, rather than
+/// showing up as a bare file-path reference.
+///
+/// Deliberately narrow: more than one entry stays a plain file-list capture
+/// — a multi-file selection doesn't have one obvious "the" image to promote,
+/// and guessing wrong would be worse than leaving it as paths. The format is
+/// confirmed from the file's own bytes (`image::guess_format`), not trusted
+/// from its extension, since nothing stops a file being named `photo.png`
+/// and containing text.
+pub fn image_from_local_file(uri_list: &[u8]) -> Option<(String, Vec<u8>)> {
+    let text = std::str::from_utf8(uri_list).ok()?;
+    let mut uris = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'));
+    let uri = uris.next()?;
+    if uris.next().is_some() {
+        return None;
+    }
+
+    let path = file_uri_to_path(uri)?;
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_FILE_IMAGE {
+        return None;
+    }
+
+    let bytes = std::fs::read(&path).ok()?;
+    let mime = match image::guess_format(&bytes).ok()? {
+        image::ImageFormat::Png => "image/png",
+        image::ImageFormat::Jpeg => "image/jpeg",
+        image::ImageFormat::Gif => "image/gif",
+        image::ImageFormat::WebP => "image/webp",
+        image::ImageFormat::Bmp => "image/bmp",
+        _ => return None, // a format clipd doesn't ship a decoder for
+    };
+    Some((mime.to_string(), bytes))
+}
+
+/// `file:///home/you/pic.png` -> `/home/you/pic.png`. No crate for this: the
+/// grammar clipd needs is one prefix strip and percent-decoding, not the
+/// general URI spec — GVFS/Nautilus always writes the empty-authority
+/// (triple-slash) form; `file://localhost/...` is accepted too since it's a
+/// common equivalent. Any other authority names a different machine, which
+/// isn't something clipd can read a file from.
+fn file_uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let path = if let Some(p) = rest.strip_prefix('/') {
+        format!("/{p}")
+    } else if let Some(p) = rest.strip_prefix("localhost/") {
+        format!("/{p}")
+    } else {
+        return None;
+    };
+    Some(std::path::PathBuf::from(percent_decode(&path)))
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn is_url(t: &str) -> bool {
@@ -221,5 +303,109 @@ mod tests {
     fn preview_is_single_line_and_clamped() {
         assert_eq!(make_preview("  a\n\n  b  ", 40), "a b");
         assert_eq!(make_preview(&"x".repeat(100), 5).chars().count(), 6); // 5 + ellipsis
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        // 1x1 transparent PNG — small enough to inline here, real enough for
+        // `image::guess_format` to actually recognise.
+        base64_decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgAAIAAAUAAen63NgAAAAASUVORK5CYII=",
+        )
+    }
+
+    // Minimal decoder so this test file doesn't need a base64 dependency
+    // just for one fixture.
+    fn base64_decode(s: &str) -> Vec<u8> {
+        fn val(c: u8) -> Option<u8> {
+            match c {
+                b'A'..=b'Z' => Some(c - b'A'),
+                b'a'..=b'z' => Some(c - b'a' + 26),
+                b'0'..=b'9' => Some(c - b'0' + 52),
+                b'+' => Some(62),
+                b'/' => Some(63),
+                _ => None,
+            }
+        }
+        let mut out = Vec::new();
+        let mut buf = 0u32;
+        let mut bits = 0;
+        for &b in s.as_bytes() {
+            let Some(v) = val(b) else { continue };
+            buf = (buf << 6) | v as u32;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((buf >> bits) as u8);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn file_uri_round_trips_a_plain_path() {
+        assert_eq!(
+            file_uri_to_path("file:///home/you/pic.png"),
+            Some(std::path::PathBuf::from("/home/you/pic.png"))
+        );
+    }
+
+    #[test]
+    fn file_uri_decodes_percent_escapes() {
+        assert_eq!(
+            file_uri_to_path("file:///home/you/My%20Photo.png"),
+            Some(std::path::PathBuf::from("/home/you/My Photo.png"))
+        );
+    }
+
+    #[test]
+    fn file_uri_accepts_explicit_localhost() {
+        assert_eq!(
+            file_uri_to_path("file://localhost/home/you/pic.png"),
+            Some(std::path::PathBuf::from("/home/you/pic.png"))
+        );
+    }
+
+    #[test]
+    fn file_uri_rejects_a_remote_host() {
+        assert_eq!(file_uri_to_path("file://otherbox/home/you/pic.png"), None);
+    }
+
+    #[test]
+    fn single_local_image_is_read_and_identified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.png");
+        std::fs::write(&path, tiny_png()).unwrap();
+
+        let uri_list = format!("file://{}\n", path.display());
+        let (mime, data) = image_from_local_file(uri_list.as_bytes()).unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(data, tiny_png());
+    }
+
+    #[test]
+    fn multiple_files_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.png");
+        let b = dir.path().join("b.png");
+        std::fs::write(&a, tiny_png()).unwrap();
+        std::fs::write(&b, tiny_png()).unwrap();
+
+        let uri_list = format!("file://{}\nfile://{}\n", a.display(), b.display());
+        assert_eq!(image_from_local_file(uri_list.as_bytes()), None);
+    }
+
+    #[test]
+    fn a_non_image_file_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, b"just some text, not a picture").unwrap();
+
+        let uri_list = format!("file://{}\n", path.display());
+        assert_eq!(image_from_local_file(uri_list.as_bytes()), None);
+    }
+
+    #[test]
+    fn a_missing_file_is_left_alone() {
+        assert_eq!(image_from_local_file(b"file:///no/such/file.png\n"), None);
     }
 }

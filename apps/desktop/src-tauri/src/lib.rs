@@ -1,10 +1,14 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! Copyright (C) 2026 Ganesh Bastapure
+//!
 //! Tauri shell for the clipboard popup.
 //!
 //! The window is created at startup and kept **hidden**, fully rendered, with
 //! its item list already populated from the daemon's push stream. Opening the
-//! popup is therefore `show() + set_focus()` — no query, no React mount, no
-//! layout from scratch. That is the whole reason it can feel instant; every
-//! other optimisation is noise next to not doing the work at open time.
+//! popup is therefore a `show()` plus the daemon's platform focus request — no
+//! query, no React mount, no layout from scratch. That is the whole reason it
+//! can feel instant; every other optimisation is noise next to not doing the
+//! work at open time.
 //!
 //! Wayland auto-paste is driven from here rather than the daemon, simply
 //! because this process is the one that knows when the popup has finished
@@ -20,7 +24,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use clipd_ipc::{Item, Request};
-use clipd_platform::shell_ext;
+use clipd_platform::{shell_ext, uinput};
 use tauri::{Emitter, Manager, PhysicalPosition, Position, WebviewWindow};
 
 const POPUP: &str = "popup";
@@ -89,17 +93,48 @@ fn search(query: String, limit: u32) -> Result<Vec<Item>, String> {
     daemon::items(&Request::Search { query, limit })
 }
 
+#[tauri::command]
+fn thumbnail(id: i64) -> Result<String, String> {
+    match daemon::request(&Request::Thumbnail { id })? {
+        clipd_ipc::Response::Thumbnail { data } => Ok(data),
+        other => Err(format!("unexpected thumbnail response: {other:?}")),
+    }
+}
+
 /// Can we auto-paste right now — i.e. should the popup hide *before* the
 /// paste, rather than stay up to say "press Ctrl+V"?
+/// Is *some* Wayland auto-paste mechanism available right now?
 ///
-/// Always true on X11 (XTEST works, answered locally with no IPC). On Wayland
-/// it is true only when the clipd GNOME Shell extension is installed and
-/// enabled, since nothing else may inject a keystroke there. Checked fresh on
-/// every paste, never cached — the user can enable or disable the extension
-/// at any time, and a stale answer would leave auto-paste silently off.
+/// uinput is tried first: no GNOME dependency and no logout, since a kernel
+/// virtual keyboard is indistinguishable from real hardware to the
+/// compositor. `shell_ext` (the GNOME Shell extension) is the fallback —
+/// still needed right after a fresh install before the udev rule/ACL from
+/// `scripts/build-deb.sh`'s postinst has applied, or on a GNOME session
+/// where uinput's one-time permission grant hasn't been run yet.
+fn wayland_autopaste_available() -> bool {
+    uinput::is_available() || shell_ext::is_available()
+}
+
+/// Press Ctrl+V through whichever mechanism [`wayland_autopaste_available`]
+/// found, uinput preferred. Caller must already have hidden the popup and
+/// waited [`shell_ext::FOCUS_SETTLE`] for focus to return to the window the
+/// user was actually in — that wait applies identically regardless of which
+/// mechanism ends up injecting the keystroke.
+fn wayland_paste() -> Result<(), String> {
+    if uinput::is_available() {
+        uinput::paste().map_err(|e| e.to_string())
+    } else {
+        shell_ext::paste().map_err(|e| e.to_string())
+    }
+}
+
+/// Always true on X11 (XTEST works, answered locally with no IPC). Checked
+/// fresh on every paste, never cached — the uinput permission grant or the
+/// GNOME extension can each become available or unavailable mid-session, and
+/// a stale answer would leave auto-paste silently off.
 #[tauri::command]
 fn can_autopaste() -> bool {
-    !clipd_ipc::is_wayland() || shell_ext::is_available()
+    !clipd_ipc::is_wayland() || wayland_autopaste_available()
 }
 
 #[tauri::command]
@@ -110,13 +145,13 @@ fn paste(id: i64, plain: bool) -> Result<(), String> {
     daemon::request(&Request::Paste { id, plain })?;
 
     // On X11 the daemon does the injection itself (XTEST, with focus restore).
-    // On Wayland it cannot, so we ask the shell extension instead. The caller
-    // hides the popup before invoking this (see App.tsx), gated on the same
-    // `can_autopaste` check, so focus is already on its way back to the user's
-    // real window by the time we get here.
-    if clipd_ipc::is_wayland() && shell_ext::is_available() {
+    // On Wayland it cannot, so we ask uinput or the shell extension instead.
+    // The caller hides the popup before invoking this (see App.tsx), gated on
+    // the same `can_autopaste` check, so focus is already on its way back to
+    // the user's real window by the time we get here.
+    if clipd_ipc::is_wayland() && wayland_autopaste_available() {
         std::thread::sleep(shell_ext::FOCUS_SETTLE);
-        if let Err(e) = shell_ext::paste() {
+        if let Err(e) = wayland_paste() {
             // The clipboard is set either way; only the keystroke failed. The
             // popup is already hidden by now, so there is nowhere to show a
             // toast — log it and leave the user a working manual Ctrl+V.
@@ -124,6 +159,31 @@ fn paste(id: i64, plain: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[tauri::command]
+fn paste_text(window: WebviewWindow, text: String) -> Result<(), String> {
+    hide_and_remember(&window);
+    daemon::request(&Request::SetText { text, paste: true })?;
+    if clipd_ipc::is_wayland() && wayland_autopaste_available() {
+        std::thread::sleep(shell_ext::FOCUS_SETTLE);
+        wayland_paste()?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn resize_copy(id: i64, width: u32, height: Option<u32>) -> Result<(), String> {
+    match daemon::request(&Request::ResizeCopy {
+        id,
+        width,
+        height,
+        keep_aspect_ratio: height.is_none(),
+    })? {
+        clipd_ipc::Response::Ok => Ok(()),
+        clipd_ipc::Response::Error { message } => Err(message),
+        other => Err(format!("unexpected resize response: {other:?}")),
+    }
 }
 
 #[tauri::command]
@@ -170,7 +230,6 @@ fn toggle(window: &WebviewWindow) {
             // data-tauri-drag-region — there's no title bar) actually stick
             // between opens instead of snapping back every toggle.
             let _ = window.show();
-            let _ = window.set_focus();
             let _ = window.emit("clipd://opened", ());
 
             // `set_focus` alone is not enough: it maps onto GTK's `present()`,
@@ -193,8 +252,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             recent,
             search,
+            thumbnail,
             can_autopaste,
             paste,
+            paste_text,
+            resize_copy,
             copy_item,
             delete,
             set_pinned,
@@ -214,6 +276,17 @@ pub fn run() {
                 if let Some((x, y)) = load_position() {
                     let _ = window.set_position(Position::Physical(PhysicalPosition { x, y }));
                 }
+            }
+
+            // Off the hot path: creating the uinput device involves a kernel
+            // ioctl round trip and a wait for udev/the compositor to attach to
+            // it, which would otherwise show up as the very first paste's
+            // latency. A no-op on X11 sessions and harmless if the permission
+            // grant hasn't landed yet — `uinput::paste()` retries on its own.
+            if clipd_ipc::is_wayland() {
+                std::thread::Builder::new()
+                    .name("clipd-uinput-warmup".into())
+                    .spawn(uinput::warm_up)?;
             }
 
             // Bridge daemon events onto the webview. Reconnects on its own, so

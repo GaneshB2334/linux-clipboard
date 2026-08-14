@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! Copyright (C) 2026 Ganesh Bastapure
+//!
 //! Storage and content classification for the clipboard daemon.
 //!
 //! No platform I/O lives here — clipboard backends are in `clipd-platform`, so
@@ -10,6 +13,8 @@ pub use store::{now_ms, text_capture, Captured, Store};
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
 
     fn temp_store() -> (Store, tempfile::TempDir) {
@@ -97,6 +102,35 @@ mod tests {
         };
         assert!(s.insert(with_caption, false).unwrap().is_some());
         assert!(s.insert(renamed, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn image_metadata_thumbnail_and_resize_are_available() {
+        let (mut s, _d) = temp_store();
+        let source = image::DynamicImage::new_rgba8(8, 4);
+        let mut png = Cursor::new(Vec::new());
+        source.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let item = s
+            .insert(
+                Captured {
+                    flavors: vec![("image/png".into(), png.into_inner())],
+                    source_app: None,
+                    hinted_secret: false,
+                },
+                false,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(item.image_width, Some(8));
+        assert_eq!(item.image_height, Some(4));
+        assert_eq!(item.image_format.as_deref(), Some("image/png"));
+        assert!(item.has_thumbnail);
+        assert!(s.thumbnail(item.id).unwrap().is_some());
+
+        let resized = s.resized_capture(item.id, 4, None, true).unwrap().unwrap();
+        let decoded = image::load_from_memory(&resized.flavors[0].1).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (4, 2));
     }
 
     /// But re-copying something that is *not* at the head is a real copy: it

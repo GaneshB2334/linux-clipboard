@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! Copyright (C) 2026 Ganesh Bastapure
+//!
 //! Platform backends for clipboard capture, paste injection and hotkeys.
 //!
 //! Everything the compositor makes hard lives behind these two channels, so the
@@ -6,10 +9,14 @@
 //! this line changes.
 //!
 //! Backend status:
-//!   * [`x11`]       — capture, clipboard ownership, XTEST paste, XI2 hotkey.
-//!     Also carries capture and clipboard writes on Wayland, since Mutter
-//!     bridges selections to and from XWayland (see docs/phase-0-findings.md).
+//!   * [`x11`]       — X11 capture, ownership, XTEST paste and XI2 hotkey; it
+//!     also activates the deliberately-XWayland popup on either session type.
+//!   * [`wayland`]   — native capture and clipboard ownership through
+//!     `wl-paste`/`wl-copy`.
+//!   * [`uinput`]    — Wayland (and X11) auto-paste via a kernel-level virtual
+//!     keyboard. Tried first: no GNOME dependency, no logout.
 //!   * [`shell_ext`] — Wayland auto-paste via the clipd GNOME Shell extension.
+//!     Fallback for when the uinput permission grant hasn't landed yet.
 //!   * `datacontrol` — wlr/ext-data-control for KDE, wlroots, GNOME 48+ (planned)
 //!
 //! A `RemoteDesktop`-portal backend was implemented and then removed: it needs
@@ -21,7 +28,52 @@
 use clipd_core::Captured;
 
 pub mod shell_ext;
+pub mod uinput;
+pub mod wayland;
 pub mod x11;
+
+/// Select the platform backend from the current login session.
+///
+/// A Wayland session prefers [`wayland`] (event-driven, no XWayland round
+/// trip), but that backend needs the compositor's wlroots `data-control`
+/// protocol — Mutter only gained it in version 48. [`wayland::spawn`]
+/// verifies this synchronously (starts the watcher and confirms it actually
+/// stays alive) rather than assuming, so a Wayland session on an older
+/// Mutter falls back here to [`x11`], which has worked on every session type
+/// throughout this project via XWayland selection bridging. Without this
+/// fallback, a session where `wayland::spawn` "succeeds" but capture can
+/// never work is indistinguishable from one where it's working — the daemon
+/// runs, the socket listens, and nothing is ever captured.
+pub fn spawn(
+    signals: std::sync::mpsc::Sender<Signal>,
+    hotkey: Option<Hotkey>,
+) -> anyhow::Result<(BackendHandle, std::thread::JoinHandle<()>)> {
+    if is_wayland() {
+        match wayland::spawn(signals.clone()) {
+            Ok((handle, thread)) => return Ok((BackendHandle::Wayland(handle), thread)),
+            Err(e) => eprintln!(
+                "clipd: Wayland clipboard backend unavailable ({e:#}), falling back to the X11 \
+                 backend via XWayland — capture and paste both still work, just not through \
+                 wl-clipboard"
+            ),
+        }
+    }
+    x11::spawn(signals, hotkey).map(|(handle, thread)| (BackendHandle::X11(handle), thread))
+}
+
+pub enum BackendHandle {
+    X11(x11::X11Handle),
+    Wayland(wayland::WaylandHandle),
+}
+
+impl BackendHandle {
+    pub fn send(&mut self, cmd: Cmd) -> anyhow::Result<()> {
+        match self {
+            Self::X11(handle) => handle.send(cmd),
+            Self::Wayland(handle) => handle.send(cmd),
+        }
+    }
+}
 
 /// Commands the daemon sends to the platform thread.
 pub enum Cmd {

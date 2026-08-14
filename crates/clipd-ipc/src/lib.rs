@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! Copyright (C) 2026 Ganesh Bastapure
+//!
 //! Wire types shared by the daemon, the UI and `clipctl`.
 //!
 //! These derive `TS`, so `cargo test -p clipd-ipc` regenerates the TypeScript
@@ -58,6 +61,23 @@ pub struct Item {
     pub source_app: Option<String>,
     /// Every MIME type captured for this one copy, e.g. `["text/html", "UTF8_STRING"]`.
     pub mimes: Vec<String>,
+    /// Pixel width for image entries.
+    pub image_width: Option<u32>,
+    /// Pixel height for image entries.
+    pub image_height: Option<u32>,
+    /// Original image MIME type when the item is an image.
+    pub image_format: Option<String>,
+    /// Whether a lazy-loadable thumbnail exists for this item.
+    pub has_thumbnail: bool,
+}
+
+/// Binary flavor used by the native Wayland capture helper. `data` is base64
+/// so large images never become JSON arrays of individual numbers.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CapturedFlavor {
+    pub mime: String,
+    pub data: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -93,6 +113,28 @@ pub enum Request {
         id: i64,
         favorite: bool,
     },
+    /// Capture one clipboard offer from the wl-clipboard helper.
+    Capture {
+        flavors: Vec<CapturedFlavor>,
+        hinted_secret: bool,
+    },
+    /// Return a small image thumbnail as a base64 data URL payload.
+    Thumbnail {
+        #[ts(type = "number")]
+        id: i64,
+    },
+    /// Resize an image, copy it to the clipboard, and add the result as a new
+    /// history item without changing the original.
+    ResizeCopy {
+        #[ts(type = "number")]
+        id: i64,
+        width: u32,
+        height: Option<u32>,
+        keep_aspect_ratio: bool,
+    },
+    /// Put transient text on the clipboard, optionally injecting paste. The
+    /// text is marked as daemon-owned so the watcher does not duplicate it.
+    SetText { text: String, paste: bool },
     /// Clear everything except pinned items.
     ClearAll,
     /// Sent by `clipctl` when the hotkey fires.
@@ -117,6 +159,7 @@ pub enum Response {
     Ok,
     Error { message: String },
     Pong,
+    Thumbnail { data: String },
 }
 
 /// Pushed to subscribed clients. The warm UI keeps its list current from these,

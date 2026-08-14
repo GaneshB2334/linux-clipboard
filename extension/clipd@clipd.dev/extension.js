@@ -16,11 +16,10 @@
  * mechanism the shell uses for its own on-screen keyboard. No portal, no
  * permission dialog, no indicator.
  *
- * This extension is deliberately tiny: it owns one D-Bus name and exposes one
- * method. All the actual clipboard management (history, search, storage,
+ * This extension is deliberately tiny: it owns one D-Bus name and exposes two
+ * methods. All the actual clipboard management (history, search, storage,
  * the popup UI) stays in clipd itself. Nothing here reads the clipboard or
- * stores anything, so the extension's attack surface is a single method that
- * presses Ctrl+V.
+ * stores anything. It can only focus clipd's own popup and press Ctrl+V.
  */
 
 import Clutter from 'gi://Clutter';
@@ -33,6 +32,7 @@ const OBJECT_PATH = '/dev/clipd/PasteHelper';
 const IFACE = `
 <node>
   <interface name="dev.clipd.PasteHelper">
+    <method name="Focus"/>
     <method name="Paste"/>
   </interface>
 </node>`;
@@ -53,6 +53,38 @@ export default class ClipdPasteHelper extends Extension {
             null,
             null,
             null);
+    }
+
+    /**
+     * Activate clipd's popup through Mutter itself.
+     *
+     * A normal process cannot reliably activate an old window on Wayland:
+     * Mutter may accept the first request while launch context is fresh, then
+     * reject later requests as focus stealing. This extension runs inside the
+     * compositor, so Meta.Window.activate() is the authoritative path and does
+     * not depend on XWayland timing or a stale activation token.
+     */
+    Focus() {
+        // WM_CLASS alone doesn't identify the real popup: GTK/WebKit sets it
+        // application-wide, and clipd-desktop's process also owns a tiny
+        // internal helper window (a WebKitGTK implementation detail, not
+        // anything clipd creates) that inherits the exact same class.
+        // Activating that one instead of the real popup made focus land on a
+        // window nobody can see or type into — intermittently, since which
+        // of the two Shell happened to enumerate first decided it. The
+        // title actually differs ("Clipboard", set via tauri.conf.json), so
+        // require it too.
+        const popup = global.get_window_actors()
+            .map(actor => actor.meta_window)
+            .find(window => {
+                const wmClass = window.get_wm_class()?.toLowerCase() ?? '';
+                return wmClass.includes('clipd-desktop') && window.get_title() === 'Clipboard';
+            });
+
+        if (!popup)
+            throw new Error('clipd popup window is not mapped');
+
+        popup.activate(global.get_current_time());
     }
 
     disable() {

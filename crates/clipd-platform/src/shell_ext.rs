@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! Copyright (C) 2026 Ganesh Bastapure
+//!
 //! Wayland auto-paste via the clipd GNOME Shell extension.
 //!
 //! # Why an extension rather than a portal
@@ -19,9 +22,9 @@
 //! Indicator) does it this way.
 //!
 //! So the shipped extension (`extension/clipd@clipd.dev`) is deliberately
-//! minimal: it owns one D-Bus name and exposes one method that presses
-//! Ctrl+V. All clipboard logic stays here in clipd. The extension reads
-//! nothing and stores nothing.
+//! minimal: it owns one D-Bus name and exposes methods that focus clipd's own
+//! popup and press Ctrl+V. All clipboard logic stays here in clipd. The
+//! extension reads nothing and stores nothing.
 //!
 //! # Availability
 //!
@@ -80,6 +83,20 @@ pub fn is_available() -> bool {
         Ok(proxy) => proxy.name_has_owner(name).unwrap_or(false),
         Err(_) => false,
     }
+}
+
+/// Ask GNOME Shell itself to activate clipd's popup.
+///
+/// This is the durable Wayland focus path. A Tauri/GTK request may work on the
+/// first map while startup context is fresh, but Mutter correctly rejects
+/// later application-originated attempts as focus stealing. The extension is
+/// already part of the compositor and can activate only the window whose
+/// WM_CLASS identifies it as clipd.
+pub fn focus_popup() -> Result<()> {
+    let conn = connection().ok_or_else(|| anyhow!("no session bus"))?;
+    conn.call_method(Some(BUS_NAME), OBJECT_PATH, Some(INTERFACE), "Focus", &())
+        .map_err(|e| anyhow!("paste helper focus call failed: {e}"))?;
+    Ok(())
 }
 
 /// Ask the extension to press Ctrl+V against the currently focused window.
