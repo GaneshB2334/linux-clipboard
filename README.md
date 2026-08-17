@@ -14,6 +14,10 @@ them.
 Works on X11 and GNOME Wayland. Installs from one `.deb`, works immediately —
 no logout, no manual setup.
 
+<img width="928" height="838" alt="image" src="https://github.com/user-attachments/assets/7c51aa66-dd98-4087-8817-30c7921d734e" />
+<img width="928" height="838" alt="image" src="https://github.com/user-attachments/assets/89f028bf-e9f2-44fd-8c44-aff8e75f9ddf" />
+
+
 ## Install
 
 ```bash
