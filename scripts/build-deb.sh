@@ -320,9 +320,30 @@ chmod 755 "$BUILD/DEBIAN/postrm"
 mkdir -p "$OUT"
 # Root-owned files inside the archive without needing root to build.
 dpkg-deb --root-owner-group --build "$BUILD" "$OUT/$PKG.deb" >/dev/null
-sha256sum "$OUT/$PKG.deb" > "$OUT/SHA256SUMS"
+
+# A second copy under a version-less name, so
+# .../releases/latest/download/clipd_${ARCH}.deb is a URL that never has to
+# change across releases — GitHub's own "latest" redirect already tracks the
+# newest tag; the only reason it wasn't enough on its own is that the asset
+# name itself had the version baked in, so a new release meant a new
+# filename, which broke every place that URL was pasted. `gh release upload`
+# (called from a release workflow, or by hand) uploads both names; install.sh
+# is happy to match whichever one it finds via its existing clipd_*_ARCH.deb
+# pattern, so nothing there needed to change.
+STABLE="clipd_${ARCH}.deb"
+cp "$OUT/$PKG.deb" "$OUT/$STABLE"
+
+# install.sh looks up the hash by the bare filename (it's what a GitHub
+# release asset is named, with no directory of its own) — sha256sum with an
+# absolute/relative path argument writes that path into the sums file
+# instead, which never matches and made every real install fail with "no
+# SHA-256 entry found" despite the file being right there. cd first so the
+# recorded name is just the filename, the way `sha256sum *` normally would.
+# Both names in one file since both get uploaded.
+(cd "$OUT" && sha256sum "$PKG.deb" "$STABLE" > SHA256SUMS)
 
 echo "built $OUT/$PKG.deb ($(du -h "$OUT/$PKG.deb" | cut -f1))"
+echo "and $OUT/$STABLE (same bytes, version-less name for a stable download URL)"
 echo "checksum written to $OUT/SHA256SUMS"
 echo
 dpkg-deb --info "$OUT/$PKG.deb" | sed -n '2,12p'

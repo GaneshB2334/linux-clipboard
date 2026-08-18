@@ -61,7 +61,7 @@ at a time, losing a URL because you copied a command right after it.
 So I built **clipd**: an open-source clipboard manager for Ubuntu and Debian with
 the popup Windows should have shipped on Linux years ago.
 
-**[→ Download the .deb](https://github.com/GaneshB2334/linux-clipboard/releases/download/v0.1.0/clipd_0.1.0_amd64.deb)**  ·  **[Source on GitHub](https://github.com/GaneshB2334/linux-clipboard)**
+**[→ Download the .deb](https://github.com/GaneshB2334/linux-clipboard/releases/latest/download/clipd_amd64.deb)**  ·  **[Source on GitHub](https://github.com/GaneshB2334/linux-clipboard)**
 
 ## What it does
 
@@ -78,14 +78,25 @@ interaction.
 
 ## Install on Ubuntu or Debian
 
-Download the package and install it:
+The quickest way:
 
 ```
-sudo apt install ./clipd_0.1.0_amd64.deb
+curl -fsSL https://raw.githubusercontent.com/GaneshB2334/linux-clipboard/main/scripts/install.sh | bash
 ```
 
-Then **log out and back in.** That starts clipd and loads its GNOME extension,
-which the desktop only picks up at session start.
+It detects your architecture and session type, downloads the matching
+release, verifies its checksum, and starts clipd — nothing else to run.
+
+Prefer to do it by hand? Grab the package from the link above, then:
+
+```
+sudo apt install ./clipd_amd64.deb
+```
+
+That's it — no logout, nothing else to configure. The popup opens with
+`Ctrl+Alt+C` immediately, and paste works out of the box: it's injected
+through a kernel-level virtual keyboard rather than a desktop-specific
+extension, so there's no per-session setup step to wait on.
 
 The popup opens with **Ctrl+Alt+C** out of the box.
 
@@ -170,7 +181,7 @@ It's version 0.1.0. It works, and I use it daily.
 
 ## Try it
 
-**[Download the .deb](https://github.com/GaneshB2334/linux-clipboard/releases/download/v0.1.0/clipd_0.1.0_amd64.deb)** — free and open source (GPL-3.0).
+**[Download the .deb](https://github.com/GaneshB2334/linux-clipboard/releases/latest/download/clipd_amd64.deb)** — free and open source (GPL-3.0).
 
 The [source is on GitHub](https://github.com/GaneshB2334/linux-clipboard), issues
 and pull requests welcome. If you build something with it or hit a bug, I'd like
@@ -195,4 +206,4 @@ to hear about it — I'm on
 **A:** Yes. Copying and history work normally. Auto-paste needs the small GNOME Shell extension included in the package, because Wayland blocks applications from sending keystrokes to each other. Without it, clipd still copies and you press Ctrl+V.
 
 **Q:** How do I install clipd on Ubuntu?
-**A:** Download the .deb and run `sudo apt install ./clipd_0.1.0_amd64.deb`, then log out and back in. The popup opens with Ctrl+Alt+C.
+**A:** Run `curl -fsSL https://raw.githubusercontent.com/GaneshB2334/linux-clipboard/main/scripts/install.sh | bash`, or download the .deb and run `sudo apt install ./clipd_amd64.deb`. No logout needed — the popup opens with Ctrl+Alt+C immediately.

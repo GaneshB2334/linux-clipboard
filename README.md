@@ -23,8 +23,8 @@ curl -fsSL https://raw.githubusercontent.com/GaneshB2334/linux-clipboard/main/sc
 Or download the package directly:
 
 ```bash
-wget https://github.com/GaneshB2334/linux-clipboard/releases/download/v0.1.0/clipd_0.1.0_amd64.deb
-sudo dpkg -i clipd_0.1.0_amd64.deb
+wget https://github.com/GaneshB2334/linux-clipboard/releases/latest/download/clipd_amd64.deb
+sudo dpkg -i clipd_amd64.deb
 ```
 
 That's it. `Ctrl+Alt+C` opens the popup right away — the shortcut is
