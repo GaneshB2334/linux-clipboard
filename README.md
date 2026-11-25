@@ -11,14 +11,19 @@ that watches your clipboard sits at **5 MB and 0% CPU** when idle, because it
 is told about clipboard changes by the display server instead of polling for
 them.
 
-Works on X11 and GNOME Wayland. Installs from one `.deb`, works immediately —
-no logout, no manual setup.
+Works on X11 and GNOME Wayland. Ships a `.deb` installer for Debian/Ubuntu
+(works immediately — no logout, no manual setup), and builds cleanly from
+source on other Linux distributions (Arch, Fedora, openSUSE, etc.).
 
 <img width="928" height="838" alt="image" src="https://github.com/user-attachments/assets/7c51aa66-dd98-4087-8817-30c7921d734e" />
 <img width="928" height="838" alt="image" src="https://github.com/user-attachments/assets/89f028bf-e9f2-44fd-8c44-aff8e75f9ddf" />
 
 
 ## Install / Update
+
+### Debian / Ubuntu (and derivatives)
+
+> **Note:** `scripts/install.sh` and the prebuilt `.deb` packages only support **Debian, Ubuntu, and Debian/Ubuntu-based distributions** (`amd64` / `arm64`). For Arch, Fedora, openSUSE, and other distros, see [Other Linux distributions](#other-linux-distributions-building-from-source) below.
 
 Install or update to the latest release (restarts `clipd` automatically while keeping your clipboard history):
 
@@ -49,15 +54,83 @@ nothing to log out for.
 ./scripts/install.sh --uninstall   # remove all of it
 ```
 
-### Building from source
+### Other Linux distributions (building from source)
+
+`clipd` runs on any Linux distribution with GTK 3 and WebKit2GTK 4.1. Build
+requires **Rust 1.85+** (`rustup`) and **Node.js + `pnpm`** (or `npm`).
+
+#### 1. Install system dependencies
+
+- **Arch / Manjaro / EndeavourOS:**
+  ```bash
+  sudo pacman -S --needed base-devel pkgconf webkit2gtk-4.1 gtk3 openssl librsvg acl wl-clipboard
+  ```
+- **Fedora:**
+  ```bash
+  sudo dnf install @development-tools pkgconf-pkg-config webkit2gtk4.1-devel gtk3-devel openssl-devel librsvg2-devel acl wl-clipboard
+  ```
+- **openSUSE (Tumbleweed / Leap):**
+  ```bash
+  sudo zypper install -t pattern devel_basis
+  sudo zypper install pkg-config webkit2gtk3-devel gtk3-devel libopenssl-devel librsvg-devel acl wl-clipboard
+  ```
+- **Debian / Ubuntu (if building from source):**
+  ```bash
+  sudo apt install build-essential pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev libssl-dev librsvg2-dev acl wl-clipboard
+  ```
+
+*(Note: `wl-clipboard` is optional — only used on Wayland compositors with `data-control`; X11 and XWayland capture work without it.)*
+
+#### 2. Build and install binaries
+
+Build the frontend **first** so Tauri embeds `apps/desktop/dist` into the Rust binary:
 
 ```bash
-sudo apt install libwebkit2gtk-4.1-dev build-essential libssl-dev \
-  libayatana-appindicator3-dev librsvg2-dev
-cargo build --release
+git clone https://github.com/GaneshB2334/linux-clipboard.git
+cd linux-clipboard
 (cd apps/desktop && pnpm install && pnpm build)
-./scripts/install.sh
+cargo build --release
+install -Dm755 target/release/{clipd,clipd-desktop,clipctl} -t ~/.local/bin/
 ```
+
+#### 3. Start `clipd` (and optional autostart on login)
+
+```bash
+./scripts/clipd-session.sh &
+```
+
+To start automatically on login (writes `~/.config/autostart/clipd.desktop`):
+
+```bash
+./scripts/install-autostart.sh
+```
+
+#### 4. Wayland setup (auto-paste & global shortcut)
+
+On Debian/Ubuntu, the `.deb` post-install script handles these automatically; on
+other distros, run them once:
+
+- **Enable `/dev/uinput` auto-paste** (no logout required):
+  ```bash
+  sudo tee /etc/udev/rules.d/99-clipd-uinput.rules >/dev/null <<'EOF'
+  ACTION=="add", SUBSYSTEM=="misc", KERNEL=="uinput", OPTIONS+="static_node=uinput"
+  KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", TAG+="uaccess"
+  EOF
+  echo "uinput" | sudo tee /etc/modules-load.d/clipd.conf >/dev/null
+  sudo modprobe uinput
+  sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=misc --attr-match=name=uinput
+  sudo setfacl -m "u:${USER}:rw" /dev/uinput
+  ```
+- **Bind the global shortcut on Wayland:** On X11, `clipd` grabs `Ctrl+Alt+C` automatically. On Wayland, add a custom keyboard shortcut in your desktop settings running:
+  ```text
+  /home/<your-user>/.local/bin/clipctl toggle
+  ```
+- **Optional GNOME Shell fallback extension** (only needed on GNOME Wayland if you want the extension fallback alongside `uinput`):
+  ```bash
+  mkdir -p ~/.local/share/gnome-shell/extensions/clipd@clipd.dev
+  cp extension/clipd@clipd.dev/{extension.js,metadata.json} ~/.local/share/gnome-shell/extensions/clipd@clipd.dev/
+  gnome-extensions enable clipd@clipd.dev
+  ```
 
 ## Features
 
