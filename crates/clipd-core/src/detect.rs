@@ -236,20 +236,23 @@ fn is_payment_card(t: &str) -> bool {
 
 /// Collapse to one line and clamp, for list rendering.
 pub fn make_preview(text: &str, max: usize) -> String {
-    let mut out = String::with_capacity(max.min(text.len()) + 1);
+    let mut out = String::with_capacity(max.min(text.len()) + 3);
+    let mut count = 0usize;
     let mut ws = false;
     for ch in text.trim().chars() {
-        if out.chars().count() >= max {
+        if count >= max {
             out.push('…');
             break;
         }
         if ch.is_whitespace() {
-            if !ws && !out.is_empty() {
+            if !ws && count > 0 {
                 out.push(' ');
+                count += 1;
                 ws = true;
             }
         } else {
             out.push(ch);
+            count += 1;
             ws = false;
         }
     }

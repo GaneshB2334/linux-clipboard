@@ -60,8 +60,33 @@ fn load_position() -> Option<(i32, i32)> {
 /// reappears wherever it was last left instead of snapping back to the
 /// `center: true` default from tauri.conf.json every time.
 fn hide_and_remember(window: &WebviewWindow) {
+    // Avoid saving a bogus (0, 0) position or rewriting disk if Focused(false)
+    // fires after the window was already hidden.
+    if !window.is_visible().unwrap_or(false) {
+        return;
+    }
     save_position(window);
     let _ = window.hide();
+}
+
+/// Check that a saved position overlaps at least one currently connected monitor
+/// so disconnecting an external display never leaves the popup trapped off-screen.
+fn position_is_visible(window: &WebviewWindow, x: i32, y: i32) -> bool {
+    let Ok(monitors) = window.available_monitors() else {
+        return true;
+    };
+    if monitors.is_empty() {
+        return true;
+    }
+    monitors.iter().any(|m| {
+        let pos = m.position();
+        let size = m.size();
+        let min_x = pos.x - 200;
+        let max_x = pos.x + size.width as i32 - 80;
+        let min_y = pos.y - 40;
+        let max_y = pos.y + size.height as i32 - 80;
+        x >= min_x && x <= max_x && y >= min_y && y <= max_y
+    })
 }
 
 /// When the header's drag region was last pressed. Asking the window manager
@@ -78,31 +103,41 @@ struct DragHint(Mutex<Option<Instant>>);
 /// clear this early — the WM owns the pointer for the whole gesture.
 const DRAG_GRACE: Duration = Duration::from_millis(800);
 
+async fn blocking<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("background task failed: {e}"))?
+}
+
 #[tauri::command]
 fn drag_hint(state: tauri::State<DragHint>) {
-    *state.0.lock().unwrap() = Some(Instant::now());
+    *state.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
 }
 
 #[tauri::command]
-fn recent(limit: u32) -> Result<Vec<Item>, String> {
-    daemon::items(&Request::Recent { limit })
+async fn recent(limit: u32) -> Result<Vec<Item>, String> {
+    blocking(move || daemon::items(&Request::Recent { limit })).await
 }
 
 #[tauri::command]
-fn search(query: String, limit: u32) -> Result<Vec<Item>, String> {
-    daemon::items(&Request::Search { query, limit })
+async fn search(query: String, limit: u32) -> Result<Vec<Item>, String> {
+    blocking(move || daemon::items(&Request::Search { query, limit })).await
 }
 
 #[tauri::command]
-fn thumbnail(id: i64) -> Result<String, String> {
-    match daemon::request(&Request::Thumbnail { id })? {
+async fn thumbnail(id: i64) -> Result<String, String> {
+    blocking(move || match daemon::request(&Request::Thumbnail { id })? {
         clipd_ipc::Response::Thumbnail { data } => Ok(data),
+        clipd_ipc::Response::Error { message } => Err(message),
         other => Err(format!("unexpected thumbnail response: {other:?}")),
-    }
+    })
+    .await
 }
 
-/// Can we auto-paste right now — i.e. should the popup hide *before* the
-/// paste, rather than stay up to say "press Ctrl+V"?
 /// Is *some* Wayland auto-paste mechanism available right now?
 ///
 /// uinput is tried first: no GNOME dependency and no logout, since a kernel
@@ -116,16 +151,30 @@ fn wayland_autopaste_available() -> bool {
 }
 
 /// Press Ctrl+V through whichever mechanism [`wayland_autopaste_available`]
-/// found, uinput preferred. Caller must already have hidden the popup and
-/// waited [`shell_ext::FOCUS_SETTLE`] for focus to return to the window the
-/// user was actually in — that wait applies identically regardless of which
-/// mechanism ends up injecting the keystroke.
+/// found, uinput preferred — automatically falling back to the GNOME Shell
+/// extension if uinput errors at runtime. Caller must already have hidden the
+/// popup and waited [`shell_ext::FOCUS_SETTLE`] for focus to return to the
+/// user's target window.
 fn wayland_paste() -> Result<(), String> {
     if uinput::is_available() {
-        uinput::paste().map_err(|e| e.to_string())
-    } else {
-        shell_ext::paste().map_err(|e| e.to_string())
+        match uinput::paste() {
+            Ok(()) => return Ok(()),
+            Err(uinput_err) => {
+                eprintln!(
+                    "clipd-desktop: uinput paste failed ({uinput_err:#}), trying GNOME extension fallback"
+                );
+                if shell_ext::is_available() {
+                    return shell_ext::paste().map_err(|ext_err| {
+                        format!(
+                            "uinput failed ({uinput_err:#}); GNOME extension fallback failed ({ext_err:#})"
+                        )
+                    });
+                }
+                return Err(uinput_err.to_string());
+            }
+        }
     }
+    shell_ext::paste().map_err(|e| e.to_string())
 }
 
 /// Always true on X11 (XTEST works, answered locally with no IPC). Checked
@@ -133,83 +182,138 @@ fn wayland_paste() -> Result<(), String> {
 /// GNOME extension can each become available or unavailable mid-session, and
 /// a stale answer would leave auto-paste silently off.
 #[tauri::command]
-fn can_autopaste() -> bool {
-    !clipd_ipc::is_wayland() || wayland_autopaste_available()
+async fn can_autopaste() -> bool {
+    tauri::async_runtime::spawn_blocking(|| {
+        !clipd_ipc::is_wayland() || wayland_autopaste_available()
+    })
+    .await
+    .unwrap_or(false)
 }
 
+/// Set the clipboard to item `id` and auto-paste when supported.
+///
+/// Returns `Ok(true)` if the popup was hidden and auto-paste was triggered, or
+/// `Ok(false)` if the item was only copied (Wayland with no paste backend) so
+/// the UI should show a brief "press Ctrl+V" toast before hiding.
+///
+/// Running `async` (with blocking I/O and sleeps off the GTK main thread) is
+/// critical: a synchronous command sleeping on the GTK main thread prevents
+/// GTK from flushing `window.hide()` / `UnmapWindow` until *after* Ctrl+V has
+/// already been fired.
 #[tauri::command]
-fn paste(id: i64, plain: bool) -> Result<(), String> {
-    // Set the clipboard first. This succeeds on every platform, independently
-    // of whether a keystroke can be injected afterward — so even a failed
-    // auto-paste always leaves the item ready for a manual Ctrl+V.
-    daemon::request(&Request::Paste { id, plain })?;
+async fn paste(window: WebviewWindow, id: i64, plain: bool) -> Result<bool, String> {
+    if clipd_ipc::is_wayland() {
+        // Set clipboard ownership *before* hiding the XWayland popup: Mutter's
+        // XWayland clipboard bridge reliably syncs X11 selection changes to
+        // Wayland while an XWayland window holds focus, and waiting for the
+        // daemon's ack guarantees the clipboard holds the item before Ctrl+V.
+        let can_auto = blocking(move || {
+            daemon::ok(&Request::Paste { id, plain })?;
+            Ok(wayland_autopaste_available())
+        })
+        .await?;
 
-    // On X11 the daemon does the injection itself (XTEST, with focus restore).
-    // On Wayland it cannot, so we ask uinput or the shell extension instead.
-    // The caller hides the popup before invoking this (see App.tsx), gated on
-    // the same `can_autopaste` check, so focus is already on its way back to
-    // the user's real window by the time we get here.
-    if clipd_ipc::is_wayland() && wayland_autopaste_available() {
-        std::thread::sleep(shell_ext::FOCUS_SETTLE);
-        if let Err(e) = wayland_paste() {
-            // The clipboard is set either way; only the keystroke failed. The
-            // popup is already hidden by now, so there is nowhere to show a
-            // toast — log it and leave the user a working manual Ctrl+V.
-            eprintln!("clipd-desktop: auto-paste failed: {e}");
+        if !can_auto {
+            return Ok(false);
         }
+
+        hide_and_remember(&window);
+
+        let _ = blocking(|| {
+            std::thread::sleep(shell_ext::FOCUS_SETTLE);
+            if let Err(e) = wayland_paste() {
+                eprintln!("clipd-desktop: auto-paste failed: {e}");
+            }
+            Ok(())
+        })
+        .await;
+        Ok(true)
+    } else {
+        hide_and_remember(&window);
+        blocking(move || {
+            // Give GTK a moment to flush UnmapWindow before X11 restores focus.
+            std::thread::sleep(Duration::from_millis(15));
+            daemon::ok(&Request::Paste { id, plain })
+        })
+        .await?;
+        Ok(true)
     }
+}
+
+#[tauri::command]
+async fn paste_text(window: WebviewWindow, text: String) -> Result<bool, String> {
+    if clipd_ipc::is_wayland() {
+        let can_auto = blocking(move || {
+            daemon::ok(&Request::SetText { text, paste: true })?;
+            Ok(wayland_autopaste_available())
+        })
+        .await?;
+
+        if !can_auto {
+            return Ok(false);
+        }
+
+        hide_and_remember(&window);
+
+        let _ = blocking(|| {
+            std::thread::sleep(shell_ext::FOCUS_SETTLE);
+            if let Err(e) = wayland_paste() {
+                eprintln!("clipd-desktop: auto-paste text failed: {e}");
+            }
+            Ok(())
+        })
+        .await;
+        Ok(true)
+    } else {
+        hide_and_remember(&window);
+        blocking(move || {
+            std::thread::sleep(Duration::from_millis(15));
+            daemon::ok(&Request::SetText { text, paste: true })
+        })
+        .await?;
+        Ok(true)
+    }
+}
+
+#[tauri::command]
+async fn resize_copy(id: i64, width: u32, height: Option<u32>) -> Result<(), String> {
+    blocking(move || {
+        daemon::ok(&Request::ResizeCopy {
+            id,
+            width,
+            height,
+            keep_aspect_ratio: height.is_none(),
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+async fn copy_item(window: WebviewWindow, id: i64) -> Result<(), String> {
+    // Take clipboard ownership before hiding so XWayland still holds focus on Wayland.
+    blocking(move || daemon::ok(&Request::Copy { id })).await?;
+    hide_and_remember(&window);
     Ok(())
 }
 
 #[tauri::command]
-fn paste_text(window: WebviewWindow, text: String) -> Result<(), String> {
-    hide_and_remember(&window);
-    daemon::request(&Request::SetText { text, paste: true })?;
-    if clipd_ipc::is_wayland() && wayland_autopaste_available() {
-        std::thread::sleep(shell_ext::FOCUS_SETTLE);
-        wayland_paste()?;
-    }
-    Ok(())
+async fn delete(id: i64) -> Result<(), String> {
+    blocking(move || daemon::ok(&Request::Delete { id })).await
 }
 
 #[tauri::command]
-fn resize_copy(id: i64, width: u32, height: Option<u32>) -> Result<(), String> {
-    match daemon::request(&Request::ResizeCopy {
-        id,
-        width,
-        height,
-        keep_aspect_ratio: height.is_none(),
-    })? {
-        clipd_ipc::Response::Ok => Ok(()),
-        clipd_ipc::Response::Error { message } => Err(message),
-        other => Err(format!("unexpected resize response: {other:?}")),
-    }
+async fn set_pinned(id: i64, pinned: bool) -> Result<(), String> {
+    blocking(move || daemon::ok(&Request::Pin { id, pinned })).await
 }
 
 #[tauri::command]
-fn copy_item(window: WebviewWindow, id: i64) -> Result<(), String> {
-    hide_and_remember(&window);
-    daemon::request(&Request::Copy { id }).map(|_| ())
+async fn set_favorite(id: i64, favorite: bool) -> Result<(), String> {
+    blocking(move || daemon::ok(&Request::Favorite { id, favorite })).await
 }
 
 #[tauri::command]
-fn delete(id: i64) -> Result<(), String> {
-    daemon::request(&Request::Delete { id }).map(|_| ())
-}
-
-#[tauri::command]
-fn set_pinned(id: i64, pinned: bool) -> Result<(), String> {
-    daemon::request(&Request::Pin { id, pinned }).map(|_| ())
-}
-
-#[tauri::command]
-fn set_favorite(id: i64, favorite: bool) -> Result<(), String> {
-    daemon::request(&Request::Favorite { id, favorite }).map(|_| ())
-}
-
-#[tauri::command]
-fn clear_all() -> Result<(), String> {
-    daemon::request(&Request::ClearAll).map(|_| ())
+async fn clear_all() -> Result<(), String> {
+    blocking(|| daemon::ok(&Request::ClearAll)).await
 }
 
 #[tauri::command]
@@ -274,7 +378,9 @@ pub fn run() {
             // every fresh process start dead centre regardless of a past drag.
             if let Some(window) = handle.get_webview_window(POPUP) {
                 if let Some((x, y)) = load_position() {
-                    let _ = window.set_position(Position::Physical(PhysicalPosition { x, y }));
+                    if position_is_visible(&window, x, y) {
+                        let _ = window.set_position(Position::Physical(PhysicalPosition { x, y }));
+                    }
                 }
             }
 
@@ -294,24 +400,32 @@ pub fn run() {
             std::thread::Builder::new()
                 .name("clipd-subscribe".into())
                 .spawn(move || loop {
-                    let handle = handle.clone();
-                    let result = daemon::subscribe(move |event| {
-                        if let Some(window) = handle.get_webview_window(POPUP) {
-                            match &event {
-                                clipd_ipc::Event::Toggle => toggle(&window),
-                                // Report emit failures. Swallowing this with
-                                // `let _ =` hid a missing capabilities file for
-                                // a whole debugging session: the list still
-                                // loaded (custom commands are always allowed),
-                                // but every pushed event was silently dropped.
-                                _ => {
-                                    if let Err(e) = window.emit("clipd://event", &event) {
-                                        eprintln!("clipd-desktop: emit failed: {e}");
+                    let sync_handle = handle.clone();
+                    let event_handle = handle.clone();
+                    let result = daemon::subscribe(
+                        move || {
+                            if let Some(window) = sync_handle.get_webview_window(POPUP) {
+                                let _ = window.emit("clipd://sync", ());
+                            }
+                        },
+                        move |event| {
+                            if let Some(window) = event_handle.get_webview_window(POPUP) {
+                                match &event {
+                                    clipd_ipc::Event::Toggle => toggle(&window),
+                                    // Report emit failures. Swallowing this with
+                                    // `let _ =` hid a missing capabilities file for
+                                    // a whole debugging session: the list still
+                                    // loaded (custom commands are always allowed),
+                                    // but every pushed event was silently dropped.
+                                    _ => {
+                                        if let Err(e) = window.emit("clipd://event", &event) {
+                                            eprintln!("clipd-desktop: emit failed: {e}");
+                                        }
                                     }
                                 }
                             }
-                        }
-                    });
+                        },
+                    );
                     if let Err(e) = result {
                         eprintln!("clipd-desktop: subscription ended: {e}");
                     }
@@ -346,7 +460,7 @@ pub fn run() {
                     .state::<DragHint>()
                     .0
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .is_some_and(|t| t.elapsed() < DRAG_GRACE);
                 if !dragging {
                     if let Some(w) = &webview {

@@ -75,12 +75,23 @@ impl BackendHandle {
     }
 }
 
+/// One-shot acknowledgment channel used when a caller needs confirmation that
+/// the platform backend has actually taken clipboard ownership before proceeding
+/// (e.g., before hiding the popup and injecting Ctrl+V on Wayland).
+pub type Ack = std::sync::mpsc::SyncSender<Result<(), String>>;
+
 /// Commands the daemon sends to the platform thread.
 pub enum Cmd {
     /// Take clipboard ownership and serve these flavors. No paste.
-    Offer { flavors: Vec<(String, Vec<u8>)> },
+    Offer {
+        flavors: Vec<(String, Vec<u8>)>,
+        ack: Option<Ack>,
+    },
     /// Take ownership, restore focus to the remembered window, inject paste.
-    Paste { flavors: Vec<(String, Vec<u8>)> },
+    Paste {
+        flavors: Vec<(String, Vec<u8>)>,
+        ack: Option<Ack>,
+    },
     /// Record the focused window *before* the popup steals focus.
     RememberFocus,
     /// Give keyboard focus to our own popup window.

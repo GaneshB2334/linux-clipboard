@@ -281,12 +281,17 @@ UDEV
     fi
 fi
 
-GREEN='\033[1;32m'; CYAN='\033[1;36m'; BOLD='\033[1m'; RESET='\033[0m'
+GREEN='\033[1;32m'; CYAN='\033[1;36m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; RESET='\033[0m'
 
 printf '\n'
 printf "${BOLD}clipd is installed and ready${RESET} — no logout needed.\n"
 printf '\n'
 printf "Press ${CYAN}Ctrl+Alt+C${RESET} to open it. ${GREEN}Works the same on X11 and Wayland.${RESET}\n"
+if [ -z "${CLIPD_INSTALLER:-}" ] && (pgrep -x clipd >/dev/null 2>&1 || pgrep -x clipd-desktop >/dev/null 2>&1); then
+    printf '\n'
+    printf "${YELLOW}Upgraded while clipd was running:${RESET} restart it to load the new version:\n"
+    printf "    ${CYAN}pkill -x clipd-desktop; pkill -x clipd; nohup /usr/bin/clipd-session >/dev/null 2>&1 &${RESET}\n"
+fi
 printf '\n'
 printf "Want ${CYAN}Super+V${RESET} instead? GNOME reserves that combo for itself, so it's a\n"
 printf "manual step: Settings > Keyboard > Keyboard Shortcuts, scroll to the\n"

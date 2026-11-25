@@ -174,6 +174,8 @@ fn capture_wayland() {
         "text/plain;charset=utf-8",
         "text/plain",
     ];
+    const TEXT_CAP: usize = 10 * 1024 * 1024;
+    const IMAGE_CAP: usize = 50 * 1024 * 1024;
     let mut flavors = Vec::new();
     for mime in wanted {
         if !types.lines().any(|line| line.trim() == mime) {
@@ -185,7 +187,8 @@ fn capture_wayland() {
         else {
             continue;
         };
-        if !data.status.success() || data.stdout.is_empty() {
+        let cap = if mime.starts_with("image/") { IMAGE_CAP } else { TEXT_CAP };
+        if !data.status.success() || data.stdout.is_empty() || data.stdout.len() > cap {
             continue;
         }
         flavors.push(serde_json::json!({

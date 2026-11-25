@@ -18,7 +18,9 @@ no logout, no manual setup.
 <img width="928" height="838" alt="image" src="https://github.com/user-attachments/assets/89f028bf-e9f2-44fd-8c44-aff8e75f9ddf" />
 
 
-## Install
+## Install / Update
+
+Install or update to the latest release (restarts `clipd` automatically while keeping your clipboard history):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/GaneshB2334/linux-clipboard/main/scripts/install.sh | bash
@@ -27,8 +29,14 @@ curl -fsSL https://raw.githubusercontent.com/GaneshB2334/linux-clipboard/main/sc
 Or download the package directly:
 
 ```bash
-wget https://github.com/GaneshB2334/linux-clipboard/releases/latest/download/clipd_amd64.deb
-sudo dpkg -i clipd_amd64.deb
+wget -O clipd_amd64.deb https://github.com/GaneshB2334/linux-clipboard/releases/latest/download/clipd_amd64.deb
+sudo apt install -y --reinstall ./clipd_amd64.deb
+```
+
+If updating via the `.deb` directly while `clipd` is already running, restart it:
+
+```bash
+pkill -x clipd-desktop; pkill -x clipd; nohup /usr/bin/clipd-session >/dev/null 2>&1 &
 ```
 
 That's it. `Ctrl+Alt+C` opens the popup right away — the shortcut is

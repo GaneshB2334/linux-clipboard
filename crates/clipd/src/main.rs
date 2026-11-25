@@ -140,50 +140,70 @@ fn main() -> Result<()> {
                 break;
             }
 
-            Msg::Action(Action::Offer { id, paste, plain }) => {
-                let flavors = {
+            Msg::Action(Action::Offer { id, paste, plain, ack }) => {
+                let (flavors, updated) = {
                     let mut store = store.lock().unwrap();
                     let all = store.flavors(id).unwrap_or_default();
-                    // "Paste as plain text" drops the rich flavors so the
-                    // target app has nothing but the text to choose from.
+                    // "Paste as plain text" drops rich flavors (HTML, images,
+                    // URIs) so the target app has nothing but plain text.
                     let flavors: Vec<_> = if plain {
                         all.into_iter()
-                            .filter(|(m, _)| m == "UTF8_STRING" || m == "text/plain;charset=utf-8")
+                            .filter(|(m, _)| {
+                                matches!(
+                                    m.as_str(),
+                                    "UTF8_STRING"
+                                        | "text/plain;charset=utf-8"
+                                        | "text/plain"
+                                        | "STRING"
+                                        | "TEXT"
+                                )
+                            })
                             .collect()
                     } else {
                         all
                     };
-                    if !flavors.is_empty() {
+                    let updated = if !flavors.is_empty() {
                         let _ = store.touch(id);
-                    }
-                    flavors
+                        store.get(id).ok().flatten()
+                    } else {
+                        None
+                    };
+                    (flavors, updated)
                 };
                 if flavors.is_empty() {
-                    eprintln!("clipd: item {id} has no usable flavors");
+                    let msg = format!("item {id} has no usable flavors");
+                    eprintln!("clipd: {msg}");
+                    if let Some(ack) = ack {
+                        let _ = ack.send(Err(msg));
+                    }
                     continue;
+                }
+                if let Some(item) = updated {
+                    hub.broadcast(&Event::Updated { item });
                 }
 
                 // XTEST cannot reach native Wayland clients and EWMH cannot
                 // see their windows, so the X11 backend's own Cmd::Paste
                 // (which relies on both) would silently do nothing there.
                 // On Wayland only ever set the clipboard; the injection is
-                // done by the UI process via the GNOME Shell extension, which
-                // also knows when the popup has finished hiding. See
-                // apps/desktop/src-tauri/src/lib.rs and
-                // crates/clipd-platform/src/shell_ext.rs.
+                // done by the UI process via uinput / the GNOME Shell extension,
+                // which also knows when the popup has finished hiding.
                 let wants_xtest_paste = paste && !clipd_platform::is_wayland();
-                let cmd =
-                    if wants_xtest_paste { Cmd::Paste { flavors } } else { Cmd::Offer { flavors } };
+                let cmd = if wants_xtest_paste {
+                    Cmd::Paste { flavors, ack }
+                } else {
+                    Cmd::Offer { flavors, ack }
+                };
                 if let Err(e) = backend.send(cmd) {
                     eprintln!("clipd: backend send failed: {e}");
                 }
             }
 
-            Msg::Action(Action::OfferFlavors { flavors, paste }) => {
+            Msg::Action(Action::OfferFlavors { flavors, paste, ack }) => {
                 let cmd = if paste && !clipd_platform::is_wayland() {
-                    Cmd::Paste { flavors }
+                    Cmd::Paste { flavors, ack }
                 } else {
-                    Cmd::Offer { flavors }
+                    Cmd::Offer { flavors, ack }
                 };
                 if let Err(e) = backend.send(cmd) {
                     eprintln!("clipd: backend send failed: {e}");

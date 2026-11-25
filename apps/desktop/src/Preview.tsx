@@ -17,7 +17,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import type { Item } from "./api";
-import { api } from "./api";
+import { api, getCachedThumbnail } from "./api";
 
 /**
  * Detail pane for the selected row.
@@ -27,25 +27,53 @@ import { api } from "./api";
  * about which of three similar-looking items is the one you want.
  */
 export function Preview({ item, onMessage }: { item: Item; onMessage?: (message: string) => void }) {
-  const [imageSrc, setImageSrc] = useState("");
+  const [imageSrc, setImageSrc] = useState(() => getCachedThumbnail(item.id) ?? "");
+  const [loading, setLoading] = useState(
+    () => item.kind === "image" && item.has_thumbnail && !getCachedThumbnail(item.id),
+  );
   const [customWidth, setCustomWidth] = useState("");
   const [customHeight, setCustomHeight] = useState("");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    let alive = true;
-    setImageSrc("");
-    if (item.kind === "image" && item.has_thumbnail) {
-      api.thumbnail(item.id).then((value) => {
-        if (alive) setImageSrc(value);
-      }).catch(() => undefined);
+    setCustomWidth("");
+    setCustomHeight("");
+
+    const cached = getCachedThumbnail(item.id);
+    if (cached !== undefined) {
+      setImageSrc(cached);
+      setLoading(false);
+      return;
     }
+
+    setImageSrc("");
+    if (item.kind !== "image" || !item.has_thumbnail) {
+      setLoading(false);
+      return;
+    }
+
+    let alive = true;
+    setLoading(true);
+    api
+      .thumbnail(item.id)
+      .then((value) => {
+        if (alive) setImageSrc(value);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
     return () => {
       alive = false;
     };
   }, [item.id, item.kind, item.has_thumbnail]);
 
+  const parsedWidth = Number(customWidth);
+  const parsedHeight = customHeight ? Number(customHeight) : undefined;
+  const customValid = parsedWidth > 0 && (parsedHeight === undefined || parsedHeight > 0);
+
   const resize = async (width: number, height?: number) => {
+    if (width <= 0 || (height !== undefined && height <= 0)) return;
     setBusy(true);
     try {
       await api.resizeCopy(item.id, width, height);
@@ -73,15 +101,22 @@ export function Preview({ item, onMessage }: { item: Item; onMessage?: (message:
           <div className="overflow-hidden rounded-xl bg-black/[0.04] dark:bg-white/[0.055]">
             {imageSrc ? (
               <img src={imageSrc} alt="Clipboard preview" className="max-h-48 w-full object-contain" />
-            ) : (
+            ) : loading ? (
               <div className="grid h-32 place-items-center text-neutral-400" aria-label="Loading preview">
                 <LoaderCircle className="size-5 animate-spin" strokeWidth={1.8} />
+              </div>
+            ) : (
+              <div className="grid h-32 place-items-center text-neutral-400" aria-label="No preview available">
+                <ImageIcon className="size-6" strokeWidth={1.8} />
               </div>
             )}
           </div>
           <div className="flex items-center gap-1.5 text-xs text-neutral-500">
             <ImageIcon className="size-3.5" strokeWidth={1.8} />
-            {item.image_width} × {item.image_height} · {item.image_format?.replace("image/", "").toUpperCase()}
+            {item.image_width && item.image_height
+              ? `${item.image_width} × ${item.image_height} · `
+              : ""}
+            {item.image_format?.replace("image/", "").toUpperCase() ?? "IMAGE"}
           </div>
         </>
       ) : (
@@ -140,6 +175,12 @@ export function Preview({ item, onMessage }: { item: Item; onMessage?: (message:
             <input
               value={customWidth}
               onChange={(event) => setCustomWidth(event.target.value.replace(/\D/g, ""))}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !busy && customValid) {
+                  event.preventDefault();
+                  void resize(parsedWidth, parsedHeight);
+                }
+              }}
               placeholder="Width"
               inputMode="numeric"
               className="min-w-0 flex-1 rounded-lg bg-black/[0.05] px-2 py-1.5 text-[11px] outline-none ring-[var(--accent)] focus:ring-1 dark:bg-white/[0.08]"
@@ -147,14 +188,20 @@ export function Preview({ item, onMessage }: { item: Item; onMessage?: (message:
             <input
               value={customHeight}
               onChange={(event) => setCustomHeight(event.target.value.replace(/\D/g, ""))}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !busy && customValid) {
+                  event.preventDefault();
+                  void resize(parsedWidth, parsedHeight);
+                }
+              }}
               placeholder="Height"
               inputMode="numeric"
               className="min-w-0 flex-1 rounded-lg bg-black/[0.05] px-2 py-1.5 text-[11px] outline-none ring-[var(--accent)] focus:ring-1 dark:bg-white/[0.08]"
             />
             <button
               type="button"
-              disabled={busy || !customWidth}
-              onClick={() => resize(Number(customWidth), customHeight ? Number(customHeight) : undefined)}
+              disabled={busy || !customValid}
+              onClick={() => resize(parsedWidth, parsedHeight)}
               title="Resize and copy"
               aria-label="Resize and copy"
               className="grid size-7 place-items-center rounded-lg bg-[var(--accent)] text-white transition-transform active:scale-[0.92] disabled:opacity-40"

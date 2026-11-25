@@ -3,7 +3,6 @@
 //!
 //! SQLite-backed history. Single writer, owned by the daemon.
 
-use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
@@ -33,7 +32,7 @@ impl Captured {
         const ORDER: &[&str] = &[
             "image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp",
             "text/uri-list", "text/html", "UTF8_STRING",
-            "text/plain;charset=utf-8", "STRING", "TEXT",
+            "text/plain;charset=utf-8", "text/plain", "STRING", "TEXT",
         ];
         ORDER
             .iter()
@@ -41,14 +40,35 @@ impl Captured {
             .or_else(|| self.flavors.first())
     }
 
-    /// Longest text flavor, for preview/search/secret-scanning.
-    pub fn text(&self) -> Option<String> {
+    /// Best UTF-8 text flavor, for preview/search/secret-scanning/hashing.
+    ///
+    /// Plain-text flavors win over markup like `text/html` so browser copies
+    /// display readable text rather than raw HTML tags, AND so GNOME's
+    /// ownership hand-off (which often drops `text/html`) hashes identically
+    /// instead of creating duplicate rows. Borrows directly with zero copies.
+    pub fn text(&self) -> Option<&str> {
+        const PLAIN: &[&str] = &[
+            "UTF8_STRING",
+            "text/plain;charset=utf-8",
+            "text/plain",
+            "STRING",
+            "TEXT",
+        ];
+        for want in PLAIN {
+            if let Some(s) = self
+                .flavors
+                .iter()
+                .find(|(m, _)| m == want)
+                .and_then(|(_, d)| std::str::from_utf8(d).ok())
+                .filter(|s| !s.is_empty())
+            {
+                return Some(s);
+            }
+        }
         self.flavors
             .iter()
-            .filter(|(m, _)| {
-                m.starts_with("text/") || m == "UTF8_STRING" || m == "STRING" || m == "TEXT"
-            })
-            .filter_map(|(_, d)| String::from_utf8(d.clone()).ok())
+            .filter(|(m, _)| m.starts_with("text/"))
+            .filter_map(|(_, d)| std::str::from_utf8(d).ok())
             .max_by_key(|s| s.len())
     }
 }
@@ -188,7 +208,7 @@ impl Store {
 
         let text = cap.text();
         let sensitive = cap.hinted_secret
-            || text.as_deref().map(detect::is_sensitive).unwrap_or(false);
+            || text.map(detect::is_sensitive).unwrap_or(false);
         if sensitive && !store_secrets {
             // Still update the head so the re-offer that follows is suppressed
             // too, otherwise the secret round-trips through here twice.
@@ -196,103 +216,88 @@ impl Store {
             return Ok(None);
         }
 
+        let now = now_ms();
+
+        // Check for an existing row *before* decoding image pixels or building
+        // thumbnails so re-copying an existing image promotes it in O(1).
+        let existing: Option<i64> = self
+            .conn
+            .query_row("SELECT id FROM items WHERE hash = ?1", params![&hash[..]], |r| r.get(0))
+            .optional()?;
+
+        if let Some(id) = existing {
+            self.conn.execute(
+                "UPDATE items SET last_used_at = ?1, use_count = use_count + 1 WHERE id = ?2",
+                params![now, id],
+            )?;
+            self.head_hash = Some(hash);
+            return self.get(id);
+        }
+
         let kind = detect::kind_of(&best_mime, &best_data);
-        let preview = match (&text, kind) {
+        let preview = match (text, kind) {
             (Some(t), _) => detect::make_preview(t, PREVIEW_CHARS),
             (None, Kind::Image) => format!("Image · {}", human_size(best_data.len())),
             (None, _) => format!("{} · {}", best_mime, human_size(best_data.len())),
         };
         let byte_size: i64 = cap.flavors.iter().map(|(_, d)| d.len() as i64).sum();
-        let image_info = if kind == Kind::Image {
-            image_metadata(&best_mime, &best_data)
+        let (image_info, thumbnail_path) = if kind == Kind::Image {
+            prepare_image_assets(&self.blobs, &best_mime, &best_data)
         } else {
-            None
+            (None, None)
         };
-        let thumbnail_path = image_info.as_ref().and_then(|_| {
-            let name = format!("thumb-{}.png", blake3::hash(&best_data).to_hex());
-            let path = self.blobs.join(&name);
-            if !path.exists() {
-                if let Ok(thumbnail) = make_thumbnail(&best_data) {
-                    if std::fs::write(&path, thumbnail).is_err() {
-                        return None;
-                    }
-                } else {
-                    return None;
-                }
-            }
-            Some(name)
-        });
-        let now = now_ms();
 
         let tx = self.conn.transaction()?;
 
-        // Content-addressed dedupe: re-copying something already in history
-        // promotes the existing row rather than adding a duplicate.
-        let existing: Option<i64> = tx
-            .query_row("SELECT id FROM items WHERE hash = ?1", params![&hash[..]], |r| r.get(0))
-            .optional()?;
+        tx.execute(
+            "INSERT INTO items
+               (kind, hash, preview, byte_size, created_at, last_used_at, sensitive, source_app,
+                image_width, image_height, image_format, thumbnail_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                kind_str(kind),
+                &hash[..],
+                preview,
+                byte_size,
+                now,
+                sensitive as i64,
+                cap.source_app,
+                image_info.as_ref().map(|m| m.0),
+                image_info.as_ref().map(|m| m.1),
+                image_info.as_ref().map(|m| m.2.as_str()),
+                thumbnail_path,
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
 
-        let id = match existing {
-            Some(id) => {
-                tx.execute(
-                    "UPDATE items SET last_used_at = ?1, use_count = use_count + 1 WHERE id = ?2",
-                    params![now, id],
-                )?;
-                id
-            }
-            None => {
-                tx.execute(
-                    "INSERT INTO items
-                       (kind, hash, preview, byte_size, created_at, last_used_at, sensitive, source_app,
-                        image_width, image_height, image_format, thumbnail_path)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                    params![
-                        kind_str(kind),
-                        &hash[..],
-                        preview,
-                        byte_size,
-                        now,
-                        sensitive as i64,
-                        cap.source_app,
-                        image_info.as_ref().map(|m| m.0),
-                        image_info.as_ref().map(|m| m.1),
-                        image_info.as_ref().map(|m| m.2.as_str()),
-                        thumbnail_path,
-                    ],
-                )?;
-                let id = tx.last_insert_rowid();
-
-                for (mime, data) in &cap.flavors {
-                    if data.len() >= INLINE_LIMIT {
-                        let name = format!("{}", blake3::hash(data).to_hex());
-                        let path = self.blobs.join(&name);
-                        if !path.exists() {
-                            std::fs::write(&path, data)?;
-                        }
-                        tx.execute(
-                            "INSERT OR REPLACE INTO flavors (item_id, mime, blob_path)
-                             VALUES (?1, ?2, ?3)",
-                            params![id, mime, name],
-                        )?;
-                    } else {
-                        tx.execute(
-                            "INSERT OR REPLACE INTO flavors (item_id, mime, data)
-                             VALUES (?1, ?2, ?3)",
-                            params![id, mime, data],
-                        )?;
-                    }
+        for (mime, data) in &cap.flavors {
+            if data.len() >= INLINE_LIMIT {
+                let name = format!("{}", blake3::hash(data).to_hex());
+                let path = self.blobs.join(&name);
+                if !path.exists() {
+                    std::fs::write(&path, data)?;
                 }
-
-                // Secrets are never indexed — searching must not surface them.
-                if !sensitive {
-                    tx.execute(
-                        "INSERT INTO items_fts (rowid, preview) VALUES (?1, ?2)",
-                        params![id, preview],
-                    )?;
-                }
-                id
+                tx.execute(
+                    "INSERT OR REPLACE INTO flavors (item_id, mime, blob_path)
+                     VALUES (?1, ?2, ?3)",
+                    params![id, mime, name],
+                )?;
+            } else {
+                tx.execute(
+                    "INSERT OR REPLACE INTO flavors (item_id, mime, data)
+                     VALUES (?1, ?2, ?3)",
+                    params![id, mime, data],
+                )?;
             }
-        };
+        }
+
+        // Secrets are never indexed — searching must not surface them.
+        if !sensitive {
+            tx.execute(
+                "INSERT INTO items_fts (rowid, preview) VALUES (?1, ?2)",
+                params![id, preview],
+            )?;
+        }
 
         tx.commit()?;
         self.head_hash = Some(hash);
@@ -385,6 +390,17 @@ impl Store {
         Ok(path.and_then(|name| std::fs::read(self.blobs.join(name)).ok()))
     }
 
+    /// Return the raw bytes of the image flavor for `id`, if it is an image.
+    /// Exposed separately from [`resize_image_bytes`] so the daemon can drop the
+    /// `Store` lock while running the CPU-heavy Lanczos3 resize + PNG encode.
+    pub fn image_bytes(&self, id: i64) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .flavors(id)?
+            .into_iter()
+            .find(|(mime, _)| mime.starts_with("image/"))
+            .map(|(_, data)| data))
+    }
+
     /// Create an image-only capture at the requested size. The caller inserts
     /// it as a new item, so the original remains untouched.
     pub fn resized_capture(
@@ -394,28 +410,10 @@ impl Store {
         height: Option<u32>,
         keep_aspect_ratio: bool,
     ) -> Result<Option<Captured>> {
-        if width == 0 || width > 16_384 || height.is_some_and(|h| h == 0 || h > 16_384) {
-            anyhow::bail!("image dimensions must be between 1 and 16384 pixels");
-        }
-        let source = self
-            .flavors(id)?
-            .into_iter()
-            .find(|(mime, _)| mime.starts_with("image/"));
-        let Some((_, data)) = source else { return Ok(None) };
-        let image = image::load_from_memory(&data).context("decoding image")?;
-        let target_height = if keep_aspect_ratio || height.is_none() {
-            ((image.height() as f64) * (width as f64 / image.width() as f64)).round() as u32
-        } else {
-            height.unwrap()
+        let Some(data) = self.image_bytes(id)? else {
+            return Ok(None);
         };
-        let resized = image.resize_exact(width, target_height.max(1), image::imageops::FilterType::Lanczos3);
-        let mut output = Cursor::new(Vec::new());
-        resized.write_to(&mut output, image::ImageFormat::Png)?;
-        Ok(Some(Captured {
-            flavors: vec![("image/png".into(), output.into_inner())],
-            source_app: None,
-            hinted_secret: false,
-        }))
+        Ok(Some(resize_image_bytes(&data, width, height, keep_aspect_ratio)?))
     }
 
     /// Mark a transient clipboard offer as our current head so a Wayland
@@ -454,12 +452,33 @@ impl Store {
         Ok(())
     }
 
-    /// Remove an item and its search-index entry.
+    /// Remove an item and its search-index entry, reaping any orphaned blobs.
     pub fn delete(&mut self, id: i64) -> Result<()> {
+        let has_files: bool = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM items WHERE id = ?1 AND thumbnail_path IS NOT NULL
+                UNION ALL
+                SELECT 1 FROM flavors WHERE item_id = ?1 AND blob_path IS NOT NULL
+            )",
+            params![id],
+            |r| r.get(0),
+        )?;
+
         let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM items_fts WHERE rowid = ?1", params![id])?;
+        // Use the official FTS5 external-content delete command and guard on
+        // `sensitive = 0` — sensitive rows are never inserted into `items_fts`,
+        // so deleting them from the FTS index would corrupt it.
+        tx.execute(
+            "INSERT INTO items_fts(items_fts, rowid, preview)
+             SELECT 'delete', id, preview FROM items WHERE id = ?1 AND sensitive = 0",
+            params![id],
+        )?;
         tx.execute("DELETE FROM items WHERE id = ?1", params![id])?;
         tx.commit()?;
+
+        if has_files {
+            self.gc_blobs()?;
+        }
         self.head_hash = self.load_head_hash()?;
         Ok(())
     }
@@ -468,11 +487,13 @@ impl Store {
     pub fn clear_all(&mut self) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "DELETE FROM items_fts WHERE rowid IN (SELECT id FROM items WHERE pinned = 0)",
+            "INSERT INTO items_fts(items_fts, rowid, preview)
+             SELECT 'delete', id, preview FROM items WHERE pinned = 0 AND sensitive = 0",
             [],
         )?;
         tx.execute("DELETE FROM items WHERE pinned = 0", [])?;
         tx.commit()?;
+        self.gc_blobs()?;
         self.head_hash = self.load_head_hash()?;
         Ok(())
     }
@@ -488,16 +509,21 @@ impl Store {
             let rows = stmt.query_map(params![max], |r| r.get(0))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        if ids.is_empty() {
+            return Ok(0);
+        }
         for id in &ids {
-            tx.execute("DELETE FROM items_fts WHERE rowid = ?1", params![id])?;
+            tx.execute(
+                "INSERT INTO items_fts(items_fts, rowid, preview)
+                 SELECT 'delete', id, preview FROM items WHERE id = ?1 AND sensitive = 0",
+                params![id],
+            )?;
             tx.execute("DELETE FROM items WHERE id = ?1", params![id])?;
         }
         tx.commit()?;
 
         self.gc_blobs()?;
-        if !ids.is_empty() {
-            self.head_hash = self.load_head_hash()?;
-        }
+        self.head_hash = self.load_head_hash()?;
         Ok(ids.len())
     }
 
@@ -561,17 +587,71 @@ fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
     })
 }
 
-fn image_metadata(mime: &str, data: &[u8]) -> Option<(u32, u32, String)> {
-    let image = image::load_from_memory(data).ok()?;
-    Some((image.width(), image.height(), mime.to_string()))
+/// Resize raw image bytes into a PNG `Captured` item without requiring a DB lock.
+pub fn resize_image_bytes(
+    data: &[u8],
+    width: u32,
+    height: Option<u32>,
+    keep_aspect_ratio: bool,
+) -> Result<Captured> {
+    if width == 0 || width > 16_384 || height.is_some_and(|h| h == 0 || h > 16_384) {
+        anyhow::bail!("image dimensions must be between 1 and 16384 pixels");
+    }
+    let image = image::load_from_memory(data).context("decoding image")?;
+    let target_height = if keep_aspect_ratio || height.is_none() {
+        ((image.height() as f64) * (width as f64 / image.width() as f64)).round() as u32
+    } else {
+        height.unwrap()
+    };
+    let resized = image.resize_exact(
+        width,
+        target_height.max(1),
+        image::imageops::FilterType::Lanczos3,
+    );
+    let mut output = Cursor::new(Vec::new());
+    resized.write_to(&mut output, image::ImageFormat::Png)?;
+    Ok(Captured {
+        flavors: vec![("image/png".into(), output.into_inner())],
+        source_app: None,
+        hinted_secret: false,
+    })
 }
 
-fn make_thumbnail(data: &[u8]) -> Result<Vec<u8>> {
-    let image = image::load_from_memory(data)?;
-    let thumbnail = image.thumbnail(THUMBNAIL_EDGE, THUMBNAIL_EDGE);
+/// Extract image dimensions and create a thumbnail in a single decode pass.
+/// If the content-addressed thumbnail already exists on disk, reads only the
+/// image header (`into_dimensions`) without decoding pixels at all.
+fn prepare_image_assets(
+    blobs: &Path,
+    mime: &str,
+    data: &[u8],
+) -> (Option<(u32, u32, String)>, Option<String>) {
+    let thumb_name = format!("thumb-{}.png", blake3::hash(data).to_hex());
+    let thumb_path = blobs.join(&thumb_name);
+
+    if thumb_path.exists() {
+        let dims = image::ImageReader::new(Cursor::new(data))
+            .with_guessed_format()
+            .ok()
+            .and_then(|r| r.into_dimensions().ok());
+        if let Some((w, h)) = dims {
+            return (Some((w, h, mime.to_string())), Some(thumb_name));
+        }
+    }
+
+    let Ok(decoded) = image::load_from_memory(data) else {
+        return (None, None);
+    };
+    let info = Some((decoded.width(), decoded.height(), mime.to_string()));
+    let thumbnail = decoded.thumbnail(THUMBNAIL_EDGE, THUMBNAIL_EDGE);
     let mut output = Cursor::new(Vec::new());
-    thumbnail.write_to(&mut output, image::ImageFormat::Png)?;
-    Ok(output.into_inner())
+    let saved = if thumbnail.write_to(&mut output, image::ImageFormat::Png).is_ok()
+        && std::fs::write(&thumb_path, output.into_inner()).is_ok()
+    {
+        Some(thumb_name)
+    } else {
+        None
+    };
+    (info, saved)
 }
 
 /// Identity of a copy, for dedupe and head suppression.
@@ -670,6 +750,3 @@ pub fn text_capture(text: &str) -> Captured {
         hinted_secret: false,
     }
 }
-
-#[allow(dead_code)]
-fn _unused(_: HashMap<(), ()>) {}

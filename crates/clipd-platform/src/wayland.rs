@@ -100,9 +100,14 @@ fn run(_signals: Sender<Signal>, rx: Receiver<Cmd>, mut watcher: Child) {
         };
 
         match cmd {
-            Cmd::Offer { flavors } | Cmd::Paste { flavors } => {
-                if let Err(error) = offer(&flavors) {
-                    eprintln!("clipd: Wayland clipboard offer failed: {error:#}");
+            Cmd::Offer { flavors, ack } | Cmd::Paste { flavors, ack } => {
+                let result = offer(&flavors).map_err(|error| {
+                    let msg = format!("{error:#}");
+                    eprintln!("clipd: Wayland clipboard offer failed: {msg}");
+                    msg
+                });
+                if let Some(ack) = ack {
+                    let _ = ack.send(result);
                 }
             }
             // GNOME Shell is the only authority that can activate an existing
@@ -112,14 +117,23 @@ fn run(_signals: Sender<Signal>, rx: Receiver<Cmd>, mut watcher: Child) {
             // activation too. Keep EWMH as a best-effort fallback for Wayland
             // compositors where that GNOME helper is unavailable.
             Cmd::FocusPopup => {
-                let focused = crate::shell_ext::is_available()
-                    && match crate::shell_ext::focus_popup() {
-                        Ok(()) => true,
-                        Err(error) => {
-                            eprintln!("clipd: GNOME popup focus failed: {error:#}");
-                            false
+                let mut focused = false;
+                if crate::shell_ext::is_available() {
+                    // Showing the XWayland popup is asynchronous; retry briefly
+                    // while Mutter maps the window before giving up.
+                    for attempt in 0..6 {
+                        match crate::shell_ext::focus_popup() {
+                            Ok(()) => {
+                                focused = true;
+                                break;
+                            }
+                            Err(error) if attempt == 5 => {
+                                eprintln!("clipd: GNOME popup focus failed: {error:#}");
+                            }
+                            Err(_) => std::thread::sleep(Duration::from_millis(25)),
                         }
-                    };
+                    }
+                }
                 if !focused {
                     if let Err(error) = crate::x11::focus_popup_window() {
                         eprintln!("clipd: could not focus popup: {error:#}");
@@ -161,13 +175,19 @@ fn offer(flavors: &[(String, Vec<u8>)]) -> Result<()> {
     let Some((mime, data)) = best_flavor(flavors) else {
         return Ok(());
     };
+    // Native Wayland clients expect standard MIME types, not X11 atom names
+    // like `UTF8_STRING` (used by `SetText` / emojis and X11-captured copies).
+    let wayland_mime = match mime.as_str() {
+        "UTF8_STRING" | "STRING" | "TEXT" => "text/plain;charset=utf-8",
+        other => other,
+    };
     let mut child = Command::new("wl-copy")
-        .args(["--type", mime])
+        .args(["--type", wayland_mime])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("starting wl-copy for {mime}"))?;
+        .with_context(|| format!("starting wl-copy for {wayland_mime}"))?;
     child
         .stdin
         .take()

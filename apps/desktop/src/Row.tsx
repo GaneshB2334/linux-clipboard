@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Ganesh Bastapure
 
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import {
   AppWindow,
   Clock3,
@@ -17,7 +17,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import type { Match } from "./filter";
-import { api, type Item } from "./api";
+import { api, getCachedThumbnail, type Item } from "./api";
 
 const ICONS: Record<Item["kind"], LucideIcon> = {
   text: FileText,
@@ -29,16 +29,18 @@ const ICONS: Record<Item["kind"], LucideIcon> = {
   files: Folder,
 };
 
-export function Row({
+export const Row = memo(function Row({
+  index,
   match,
   active,
-  onSelect,
+  now,
   onActivate,
 }: {
+  index: number;
   match: Match;
   active: boolean;
-  onSelect: () => void;
-  onActivate: () => void;
+  now: number;
+  onActivate: (index: number) => void;
 }) {
   const { item, ranges } = match;
   const KindIcon = ICONS[item.kind];
@@ -47,13 +49,10 @@ export function Row({
     <div
       role="option"
       aria-selected={active}
-      onMouseMove={onSelect}
-      onClick={onActivate}
+      onClick={() => onActivate(index)}
       className={[
-        "mx-1 flex h-[56px] cursor-default items-center gap-3 rounded-xl px-2.5 transition-[background-color,transform] duration-150 active:scale-[0.995]",
-        active
-          ? "bg-[oklch(0.62_0.16_255/13%)] dark:bg-[oklch(0.7_0.14_255/17%)]"
-          : "hover:bg-black/[0.035] dark:hover:bg-white/[0.045]",
+        "mx-1 flex h-[56px] cursor-pointer select-none items-center gap-3 rounded-xl px-2.5 transition-[background-color,transform] duration-150 active:scale-[0.995]",
+        active ? "bg-[var(--selection)]" : "",
       ].join(" ")}
     >
       <span
@@ -91,7 +90,7 @@ export function Row({
         <div className="mt-0.5 flex items-center gap-2.5 text-[10px] text-neutral-500 dark:text-neutral-400">
           <span className="flex shrink-0 items-center gap-1" title="Last copied">
             <Clock3 aria-hidden className="size-3" strokeWidth={1.8} />
-            {ago(Number(item.last_used_at))}
+            {ago(Number(item.last_used_at), now)}
           </span>
           {item.source_app && (
             <span className="flex min-w-0 items-center gap-1" title={`Copied from ${item.source_app}`}>
@@ -115,18 +114,26 @@ export function Row({
       )}
     </div>
   );
-}
+});
 
 function Thumbnail({ item }: { item: Item }) {
-  const [src, setSrc] = useState("");
+  const [src, setSrc] = useState(() => getCachedThumbnail(item.id) ?? "");
 
   useEffect(() => {
-    let alive = true;
-    if (item.has_thumbnail) {
-      api.thumbnail(item.id).then((value) => {
-        if (alive) setSrc(value);
-      }).catch(() => undefined);
+    const cached = getCachedThumbnail(item.id);
+    if (cached !== undefined) {
+      setSrc(cached);
+      return;
     }
+    setSrc("");
+    if (!item.has_thumbnail) return;
+    let alive = true;
+    api
+      .thumbnail(item.id)
+      .then((value) => {
+        if (alive) setSrc(value);
+      })
+      .catch(() => undefined);
     return () => {
       alive = false;
     };
@@ -158,8 +165,8 @@ function Highlight({ text, ranges }: { text: string; ranges: [number, number][] 
   return <>{parts}</>;
 }
 
-function ago(ms: number): string {
-  const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+function ago(ms: number, now: number): string {
+  const s = Math.max(0, Math.floor((now - ms) / 1000));
   if (s < 60) return "just now";
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
   if (s < 86400) return `${Math.floor(s / 3600)}h ago`;

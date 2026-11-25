@@ -9,7 +9,7 @@
 pub mod detect;
 pub mod store;
 
-pub use store::{now_ms, text_capture, Captured, Store};
+pub use store::{now_ms, resize_image_bytes, text_capture, Captured, Store};
 
 #[cfg(test)]
 mod tests {
@@ -250,5 +250,74 @@ mod tests {
         s.delete(item.id).unwrap();
         // head_hash must have been recomputed, or this would be suppressed.
         assert!(s.insert(text_capture("transient"), false).unwrap().is_some());
+    }
+
+    #[test]
+    fn html_copy_uses_plain_text_for_preview_and_dedupe() {
+        let (mut s, _d) = temp_store();
+        let from_browser = Captured {
+            flavors: vec![
+                ("text/html".into(), b"<span style=\"color:red\">hello world</span>".to_vec()),
+                ("UTF8_STRING".into(), b"hello world".to_vec()),
+            ],
+            source_app: Some("firefox".into()),
+            hinted_secret: false,
+        };
+        let item = s.insert(from_browser, false).unwrap().unwrap();
+        assert_eq!(item.preview, "hello world");
+
+        // GNOME hand-off drops text/html and re-offers plain text only.
+        assert!(
+            s.insert(text_capture("hello world"), false).unwrap().is_none(),
+            "re-offer without text/html must dedupe against the HTML+plain copy"
+        );
+    }
+
+    #[test]
+    fn deleting_sensitive_item_does_not_corrupt_fts_index() {
+        let (mut s, _d) = temp_store();
+        let normal = s.insert(text_capture("ordinary searchable text"), false).unwrap().unwrap();
+        let secret = s
+            .insert(text_capture("ghp_abcdefghijklmnopqrstuvwxyz"), true)
+            .unwrap()
+            .unwrap();
+        assert!(secret.sensitive);
+
+        s.delete(secret.id).unwrap();
+        let hits = s.search("searchable", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, normal.id);
+
+        // Clearing all with sensitive items present must also leave FTS healthy.
+        s.insert(text_capture("sk_live_1234567890abcdef"), true).unwrap();
+        s.clear_all().unwrap();
+        assert!(s.search("searchable", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_image_reaps_thumbnail_file() {
+        let (mut s, dir) = temp_store();
+        let source = image::DynamicImage::new_rgba8(8, 4);
+        let mut png = Cursor::new(Vec::new());
+        source.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let item = s
+            .insert(
+                Captured {
+                    flavors: vec![("image/png".into(), png.into_inner())],
+                    source_app: None,
+                    hinted_secret: false,
+                },
+                false,
+            )
+            .unwrap()
+            .unwrap();
+
+        let blobs = dir.path().join("blobs");
+        assert!(std::fs::read_dir(&blobs).unwrap().next().is_some());
+        s.delete(item.id).unwrap();
+        assert!(
+            std::fs::read_dir(&blobs).unwrap().next().is_none(),
+            "deleting an image must reap its unreferenced thumbnail"
+        );
     }
 }

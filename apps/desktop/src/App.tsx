@@ -2,7 +2,9 @@
 // Copyright (C) 2026 Ganesh Bastapure
 
 import {
+  Suspense,
   cloneElement,
+  lazy,
   useCallback,
   useEffect,
   useMemo,
@@ -28,16 +30,40 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { api, onDaemonEvent, onOpened, type Item } from "./api";
+import {
+  api,
+  clearThumbnailCache,
+  evictThumbnail,
+  onDaemonEvent,
+  onOpened,
+  onSync,
+  type Item,
+} from "./api";
 import { filterItems, mergeResults, type Match } from "./filter";
 import { Row } from "./Row";
 import { Preview } from "./Preview";
-import { EmojiPicker } from "./EmojiPicker";
-import { emojiForTone, filterEmojis, type EmojiTone } from "./emoji";
+import type { EmojiTone } from "./emoji";
+
+/** Lazy-loaded so the ~800 KB emojibase dataset stays off the initial popup startup path. */
+const EmojiPicker = lazy(() => import("./EmojiPicker"));
+const EMOJI_COLS = 10;
+
+type EmojiModule = typeof import("./emoji");
 
 /** How many items the hot list holds. Tier-1 filtering stays instant well past this. */
 const HOT_SIZE = 300;
 const ROW_HEIGHT = 56;
+
+/** Keep the hot list in the exact same order as SQLite: pinned first, then most recently used. */
+function upsertItem(prev: Item[], item: Item): Item[] {
+  const next = [item, ...prev.filter((i) => i.id !== item.id)];
+  next.sort((a, b) => {
+    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+    const diff = Number(b.last_used_at) - Number(a.last_used_at);
+    return diff !== 0 ? diff : b.id - a.id;
+  });
+  return next.slice(0, HOT_SIZE);
+}
 
 export default function App() {
   const [items, setItems] = useState<Item[]>([]);
@@ -47,6 +73,8 @@ export default function App() {
   const [emojiSelected, setEmojiSelected] = useState(0);
   const [emojiGroup, setEmojiGroup] = useState<number | null>(null);
   const [emojiTone, setEmojiTone] = useState<EmojiTone>(0);
+  const [emojiMod, setEmojiMod] = useState<EmojiModule | null>(null);
+  const [now, setNow] = useState(() => Date.now());
   const [recentEmojis, setRecentEmojis] = useState<string[]>(() => {
     try {
       const stored = localStorage.getItem("clipd.recent-emojis");
@@ -61,38 +89,67 @@ export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const headerRef = useRef<HTMLElement>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pastingRef = useRef(false);
+
+  const clearToastTimer = useCallback(() => {
+    if (toastTimerRef.current !== null) {
+      clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+  }, []);
+
+  const showToast = useCallback(
+    (msg: string, durationMs = 1800, hideAfter = false) => {
+      clearToastTimer();
+      setToast(msg);
+      toastTimerRef.current = setTimeout(() => {
+        toastTimerRef.current = null;
+        setToast(null);
+        if (hideAfter) void api.hide();
+      }, durationMs);
+    },
+    [clearToastTimer],
+  );
+
+  useEffect(() => clearToastTimer, [clearToastTimer]);
 
   // ---- data ------------------------------------------------------------
 
-  useEffect(() => {
+  const reloadRecent = useCallback(() => {
     api.recent(HOT_SIZE).then(setItems).catch(() => setItems([]));
   }, []);
+
+  useEffect(() => {
+    reloadRecent();
+  }, [reloadRecent]);
+
+  // Re-sync after initial connect or daemon restart so the list never goes stale.
+  useEffect(() => {
+    const un = onSync(reloadRecent);
+    return () => {
+      un.then((f) => f());
+    };
+  }, [reloadRecent]);
 
   // Keep the hot list current from the daemon's push stream. This is what lets
   // the popup open without querying anything.
   useEffect(() => {
     const un = onDaemonEvent((event) => {
-      // Notices are messages, not list mutations. Only reachable from X11 now
-      // — the daemon-side attempt at "hide, then let the daemon try Ctrl+V"
-      // failed to restore focus (rare). Wayland has no daemon-side attempt at
-      // all right now, so it never reaches this path; see `act`'s "paste"
-      // case below for how it shows its own toast instead. Hiding afterward
-      // is unconditional and safe even if the window is already hidden —
-      // `hide()` on a hidden window is a no-op.
       if (event.event === "notice") {
-        setToast(event.message);
-        setTimeout(() => {
-          setToast(null);
-          void api.hide();
-        }, 3200);
+        showToast(event.message, 3200, true);
         return;
+      }
+      if (event.event === "removed") {
+        evictThumbnail(event.id);
+      } else if (event.event === "cleared") {
+        clearThumbnailCache();
       }
       setItems((prev) => {
         switch (event.event) {
           case "added":
-            return [event.item, ...prev.filter((i) => i.id !== event.item.id)].slice(0, HOT_SIZE);
           case "updated":
-            return prev.map((i) => (i.id === event.item.id ? event.item : i));
+            return upsertItem(prev, event.item);
           case "removed":
             return prev.filter((i) => i.id !== event.id);
           case "cleared":
@@ -105,24 +162,28 @@ export default function App() {
     return () => {
       un.then((f) => f());
     };
-  }, []);
+  }, [showToast]);
 
   // Reset to a predictable state every time the popup opens. Deliberately not
   // preserving the previous query: reopening should always mean "top of list".
   useEffect(() => {
     const un = onOpened(() => {
+      clearToastTimer();
+      pastingRef.current = false;
+      setToast(null);
       setQuery("");
       setCold([]);
       setSelected(0);
       setEmojiSelected(0);
       setActiveTab("clipboard");
+      setNow(Date.now());
       listRef.current?.scrollTo({ top: 0 });
       requestAnimationFrame(() => inputRef.current?.focus());
     });
     return () => {
       un.then((f) => f());
     };
-  }, []);
+  }, [clearToastTimer]);
 
   // Tier 2: the cold tail. Debounced, and merged in when it arrives — the user
   // is already looking at tier-1 results by then.
@@ -131,18 +192,45 @@ export default function App() {
       setCold([]);
       return;
     }
+    let cancelled = false;
     const t = setTimeout(() => {
-      api.search(query, HOT_SIZE).then(setCold).catch(() => setCold([]));
+      api
+        .search(query, HOT_SIZE)
+        .then((res) => {
+          if (!cancelled) setCold(res);
+        })
+        .catch(() => {
+          if (!cancelled) setCold([]);
+        });
     }, 60);
-    return () => clearTimeout(t);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
   }, [activeTab, query]);
+
+  useEffect(() => {
+    if (activeTab !== "emoji" || emojiMod) return;
+    let alive = true;
+    import("./emoji")
+      .then((mod) => {
+        if (alive) setEmojiMod(mod);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [activeTab, emojiMod]);
 
   const matches: Match[] = useMemo(() => {
     const hot = filterItems(query, items);
     return query.trim() ? mergeResults(hot, cold, query) : hot;
   }, [query, items, cold]);
 
-  const emojiMatches = useMemo(() => filterEmojis(query, emojiGroup, recentEmojis), [query, emojiGroup, recentEmojis]);
+  const emojiMatches = useMemo(
+    () => (emojiMod ? emojiMod.filterEmojis(query, emojiGroup, recentEmojis) : []),
+    [emojiMod, query, emojiGroup, recentEmojis],
+  );
 
   // Keep the selection in range as results change under it.
   useEffect(() => {
@@ -166,10 +254,7 @@ export default function App() {
     if (activeTab === "clipboard" && matches.length) virtualizer.scrollToIndex(selected, { align: "auto" });
   }, [activeTab, selected, matches.length, virtualizer]);
 
-  const flash = useCallback((msg: string) => {
-    setToast(msg);
-    setTimeout(() => setToast(null), 1800);
-  }, []);
+  const flash = useCallback((msg: string) => showToast(msg, 1800, false), [showToast]);
 
   const changeTab = useCallback((tab: "clipboard" | "emoji") => {
     setActiveTab(tab);
@@ -189,64 +274,110 @@ export default function App() {
       switch (action) {
         case "paste":
         case "plain": {
-          // Checked fresh on every paste, not cached: whether auto-paste is
-          // possible can change between one paste and the next (Wayland only
-          // right now — auto-paste isn't implemented yet, so this is always
-          // false there; kept dynamic for when it is).
-          const auto = await api.canAutopaste();
-          if (auto) {
-            // The daemon needs focus back on the target window before it
-            // presses Ctrl+V, so hide before asking it to paste.
-            await api.hide();
-            await api.paste(item.id, action === "plain");
-          } else {
-            // No daemon event is coming to tell us to close — auto-paste
-            // was never attempted, so nothing will fire one. Set the
-            // clipboard, say so, then close ourselves once that's been read.
-            await api.paste(item.id, action === "plain");
-            setToast("Copied — press Ctrl+V to paste");
-            setTimeout(() => {
-              setToast(null);
-              void api.hide();
-            }, 1100);
+          if (action === "plain" && item.kind === "image") {
+            flash("Images cannot be pasted as plain text");
+            return;
+          }
+          // Guard against double-clicks or repeated Enter firing two pastes.
+          if (pastingRef.current) return;
+          pastingRef.current = true;
+          try {
+            const autoPasted = await api.paste(item.id, action === "plain");
+            if (!autoPasted) {
+              showToast("Copied — press Ctrl+V to paste", 1100, true);
+            }
+          } catch (error) {
+            flash(String(error));
+          } finally {
+            pastingRef.current = false;
           }
           break;
         }
         case "copy":
-          await api.copy(item.id);
+          try {
+            await api.copy(item.id);
+          } catch (error) {
+            flash(String(error));
+          }
           break;
         case "delete":
-          await api.remove(item.id);
-          flash("Deleted");
+          try {
+            await api.remove(item.id);
+            flash("Deleted");
+          } catch (error) {
+            flash(String(error));
+          }
           break;
         case "pin":
-          await api.setPinned(item.id, !item.pinned);
+          try {
+            await api.setPinned(item.id, !item.pinned);
+          } catch (error) {
+            flash(String(error));
+          }
           break;
       }
     },
-    [matches, flash],
+    [matches, flash, showToast],
   );
 
-  const pasteEmoji = useCallback(async (emoji: string) => {
-    try {
-      setRecentEmojis((previous) => {
-        const next = [emoji, ...previous.filter((value) => value !== emoji)].slice(0, 24);
-        localStorage.setItem("clipd.recent-emojis", JSON.stringify(next));
-        return next;
-      });
-      await api.pasteText(emoji);
-    } catch (error) {
-      flash(String(error));
-    }
-  }, [flash]);
+  const handleActivateRow = useCallback(
+    (index: number) => {
+      void act(index, "paste");
+    },
+    [act],
+  );
+
+  const pasteEmoji = useCallback(
+    async (emoji: string) => {
+      if (pastingRef.current) return;
+      pastingRef.current = true;
+      try {
+        setRecentEmojis((previous) => {
+          const next = [emoji, ...previous.filter((value) => value !== emoji)].slice(0, 24);
+          try {
+            localStorage.setItem("clipd.recent-emojis", JSON.stringify(next));
+          } catch {
+            // Storage quota / private mode must not block pasting.
+          }
+          return next;
+        });
+        const autoPasted = await api.pasteText(emoji);
+        if (!autoPasted) {
+          showToast("Copied — press Ctrl+V to paste", 1100, true);
+        }
+      } catch (error) {
+        flash(String(error));
+      } finally {
+        pastingRef.current = false;
+      }
+    },
+    [flash, showToast],
+  );
 
   // ---- keyboard --------------------------------------------------------
 
   const onKeyDown = useCallback(
     (e: KeyboardEvent) => {
-      // Alt+1..9 pastes the Nth item outright. Bare digits stay available for
-      // typing a search, which is the more common action by far.
-      if (e.altKey && /^[1-9]$/.test(e.key)) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        void api.hide();
+        return;
+      }
+
+      // Let auxiliary inputs (e.g. Preview's custom width/height fields) own
+      // Enter, Tab, Delete, Home, and arrows without triggering list actions.
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        target !== inputRef.current &&
+        (target.tagName === "INPUT" || target.tagName === "TEXTAREA")
+      ) {
+        return;
+      }
+
+      // Alt+1..9 pastes the Nth clipboard item outright. Bare digits stay
+      // available for typing a search, which is the more common action by far.
+      if (activeTab === "clipboard" && e.altKey && /^[1-9]$/.test(e.key)) {
         e.preventDefault();
         void act(Number(e.key) - 1, "paste");
         return;
@@ -265,24 +396,23 @@ export default function App() {
       }
 
       switch (e.key) {
-        case "Escape":
-          e.preventDefault();
-          void api.hide();
-          break;
         case "ArrowDown":
           e.preventDefault();
-          if (activeTab === "emoji") setEmojiSelected((s) => Math.min(s + 8, emojiMatches.length - 1));
-          else setSelected((s) => Math.min(s + 1, matches.length - 1));
+          if (activeTab === "emoji") {
+            setEmojiSelected((s) => Math.min(s + EMOJI_COLS, Math.max(0, emojiMatches.length - 1)));
+          } else {
+            setSelected((s) => Math.min(s + 1, Math.max(0, matches.length - 1)));
+          }
           break;
         case "ArrowUp":
           e.preventDefault();
-          if (activeTab === "emoji") setEmojiSelected((s) => Math.max(s - 8, 0));
+          if (activeTab === "emoji") setEmojiSelected((s) => Math.max(s - EMOJI_COLS, 0));
           else setSelected((s) => Math.max(s - 1, 0));
           break;
         case "ArrowRight":
           if (activeTab === "emoji") {
             e.preventDefault();
-            setEmojiSelected((s) => Math.min(s + 1, emojiMatches.length - 1));
+            setEmojiSelected((s) => Math.min(s + 1, Math.max(0, emojiMatches.length - 1)));
           }
           break;
         case "ArrowLeft":
@@ -293,40 +423,58 @@ export default function App() {
           break;
         case "PageDown":
           e.preventDefault();
-          setSelected((s) => Math.min(s + 8, matches.length - 1));
+          if (activeTab === "emoji") {
+            setEmojiSelected((s) => Math.min(s + EMOJI_COLS * 5, Math.max(0, emojiMatches.length - 1)));
+          } else {
+            setSelected((s) => Math.min(s + 8, Math.max(0, matches.length - 1)));
+          }
           break;
         case "PageUp":
           e.preventDefault();
-          setSelected((s) => Math.max(s - 8, 0));
+          if (activeTab === "emoji") setEmojiSelected((s) => Math.max(s - EMOJI_COLS * 5, 0));
+          else setSelected((s) => Math.max(s - 8, 0));
           break;
         case "Home":
           if (!query) {
             e.preventDefault();
-            setSelected(0);
+            if (activeTab === "emoji") setEmojiSelected(0);
+            else setSelected(0);
           }
           break;
         case "Enter":
           e.preventDefault();
           if (activeTab === "emoji") {
-            const emoji = emojiMatches[emojiSelected] && emojiForTone(emojiMatches[emojiSelected], emojiTone);
-            if (emoji) void pasteEmoji(emoji);
+            const entry = emojiMatches[emojiSelected];
+            if (entry && emojiMod) void pasteEmoji(emojiMod.emojiForTone(entry, emojiTone));
           } else if (e.shiftKey) void act(selected, "plain");
           else if (e.ctrlKey) void act(selected, "copy");
           else void act(selected, "paste");
           break;
         case "Delete":
-          e.preventDefault();
-          void act(selected, "delete");
+          if (activeTab === "clipboard") {
+            // Preserve forward-delete when editing in the middle of a search query.
+            const input = inputRef.current;
+            const editingMiddle =
+              input &&
+              document.activeElement === input &&
+              query.length > 0 &&
+              (input.selectionStart ?? query.length) < query.length;
+            if (!editingMiddle) {
+              e.preventDefault();
+              void act(selected, "delete");
+            }
+          }
           break;
         case "p":
-          if (e.ctrlKey) {
+        case "P":
+          if (activeTab === "clipboard" && e.ctrlKey) {
             e.preventDefault();
             void act(selected, "pin");
           }
           break;
       }
     },
-    [act, activeTab, changeTab, emojiMatches, emojiSelected, emojiTone, matches.length, pasteEmoji, selected, query],
+    [act, activeTab, changeTab, emojiMatches, emojiMod, emojiSelected, emojiTone, matches.length, pasteEmoji, selected, query],
   );
 
   // The search field owns focus permanently, so every keystroke filters
@@ -356,13 +504,18 @@ export default function App() {
   useEffect(() => {
     const onPointerDown = (e: MouseEvent) => {
       const header = headerRef.current;
-      const target = e.target as Node | null;
-      if (header && target && header.contains(target) && target !== inputRef.current) {
+      const target = e.target as Element | null;
+      if (header && target && header.contains(target) && !target.closest("input, button")) {
         void api.dragHint();
       }
     };
     window.addEventListener("mousedown", onPointerDown, { capture: true });
     return () => window.removeEventListener("mousedown", onPointerDown, { capture: true });
+  }, []);
+
+  const handleEmojiGroup = useCallback((group: number | null) => {
+    setEmojiGroup(group);
+    setEmojiSelected(0);
   }, []);
 
   const current = matches[selected]?.item;
@@ -402,6 +555,7 @@ export default function App() {
               onChange={(e) => {
                 setQuery(e.target.value);
                 setSelected(0);
+                setEmojiSelected(0);
               }}
               placeholder={activeTab === "emoji" ? "Search emojis" : "Search clipboard"}
               spellCheck={false}
@@ -411,10 +565,15 @@ export default function App() {
             {query && (
               <button
                 type="button"
-                onClick={() => setQuery("")}
+                onClick={() => {
+                  setQuery("");
+                  setSelected(0);
+                  setEmojiSelected(0);
+                  inputRef.current?.focus();
+                }}
                 aria-label="Clear search"
                 title="Clear search"
-                className="icon-button size-5"
+                className="icon-button size-5 cursor-pointer"
               >
                 <X className="size-3.5" strokeWidth={2.2} />
               </button>
@@ -453,22 +612,25 @@ export default function App() {
 
         <div className="flex min-h-0 flex-1">
           {activeTab === "emoji" ? (
-            <EmojiPicker
-              group={emojiGroup}
-              items={emojiMatches}
-              selected={emojiSelected}
-              onGroup={(group) => {
-                setEmojiGroup(group);
-                setEmojiSelected(0);
-              }}
-              onSelect={setEmojiSelected}
-              onPaste={pasteEmoji}
-              tone={emojiTone}
-              onTone={setEmojiTone}
-            />
+            <Suspense fallback={<div className="flex-1" />}>
+              <EmojiPicker
+                group={emojiGroup}
+                items={emojiMatches}
+                selected={emojiSelected}
+                onGroup={handleEmojiGroup}
+                onPaste={pasteEmoji}
+                tone={emojiTone}
+                onTone={setEmojiTone}
+              />
+            </Suspense>
           ) : (
             <>
-              <div ref={listRef} className="min-w-0 flex-1 overflow-y-auto overscroll-contain px-2 py-2">
+              <div
+                ref={listRef}
+                role="listbox"
+                aria-label="Clipboard history"
+                className="min-w-0 flex-1 overflow-y-auto overscroll-contain px-2 py-2"
+              >
                 {matches.length === 0 ? (
                   <Empty query={query} />
                 ) : (
@@ -480,10 +642,11 @@ export default function App() {
                         style={{ height: v.size, transform: `translateY(${v.start}px)` }}
                       >
                         <Row
+                          index={v.index}
                           match={matches[v.index]!}
                           active={v.index === selected}
-                          onSelect={() => setSelected(v.index)}
-                          onActivate={() => act(v.index, "paste")}
+                          now={now}
+                          onActivate={handleActivateRow}
                         />
                       </div>
                     ))}

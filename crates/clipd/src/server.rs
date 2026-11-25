@@ -10,19 +10,28 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{sync_channel, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use clipd_core::{Captured, Store};
 use clipd_ipc::{encode, Event, Request, Response};
+use clipd_platform::Ack;
+
+/// How long a request waits for the platform thread to confirm clipboard ownership.
+const OFFER_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Write timeout on subscribed streams so a stalled reader can never freeze
+/// `Hub::broadcast` (and therefore the entire daemon main loop).
+const SUBSCRIBER_WRITE_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Work that must run on the thread owning the X11 connection.
 pub enum Action {
     /// Put an item on the clipboard, optionally injecting a paste.
-    Offer { id: i64, paste: bool, plain: bool },
+    Offer { id: i64, paste: bool, plain: bool, ack: Option<Ack> },
     /// Put transient flavors on the clipboard, optionally injecting paste.
-    OfferFlavors { flavors: Vec<(String, Vec<u8>)>, paste: bool },
+    OfferFlavors { flavors: Vec<(String, Vec<u8>)>, paste: bool, ack: Option<Ack> },
     /// A capture delivered by the wl-paste watcher.
     Capture(Box<Captured>),
     /// Snapshot the focused window before the popup takes focus.
@@ -47,6 +56,7 @@ impl Hub {
     }
 
     fn subscribe(&self, stream: UnixStream) {
+        let _ = stream.set_write_timeout(Some(SUBSCRIBER_WRITE_TIMEOUT));
         self.subs.lock().unwrap().push(stream);
     }
 
@@ -129,6 +139,7 @@ fn serve_conn(stream: UnixStream, hub: Arc<Hub>, store: Arc<Mutex<Store>>, tx: S
             Ok(r) => r,
             Err(e) => {
                 out.write_all(&encode(&Response::Error { message: e.to_string() })?)?;
+                out.flush()?;
                 continue;
             }
         };
@@ -163,13 +174,30 @@ fn handle(
         }
 
         Request::Paste { id, plain } => {
-            tx.send(Msg::Action(Action::Offer { id, paste: true, plain })).ok();
-            Response::Ok
+            let (ack_tx, ack_rx) = sync_channel(1);
+            if tx
+                .send(Msg::Action(Action::Offer { id, paste: true, plain, ack: Some(ack_tx) }))
+                .is_err()
+            {
+                return Ok(Some(Response::Error { message: "daemon main loop stopped".into() }));
+            }
+            wait_ack(ack_rx)
         }
 
         Request::Copy { id } => {
-            tx.send(Msg::Action(Action::Offer { id, paste: false, plain: false })).ok();
-            Response::Ok
+            let (ack_tx, ack_rx) = sync_channel(1);
+            if tx
+                .send(Msg::Action(Action::Offer {
+                    id,
+                    paste: false,
+                    plain: false,
+                    ack: Some(ack_tx),
+                }))
+                .is_err()
+            {
+                return Ok(Some(Response::Error { message: "daemon main loop stopped".into() }));
+            }
+            wait_ack(ack_rx)
         }
 
         Request::Capture { flavors, hinted_secret } => {
@@ -205,36 +233,71 @@ fn handle(
         }
 
         Request::ResizeCopy { id, width, height, keep_aspect_ratio } => {
+            // Read raw image bytes under the lock, then release the lock while
+            // running the CPU-heavy decode/Lanczos3 resize/PNG encode so other
+            // requests (capture, search, toggle) never stall.
+            let raw = store.lock().unwrap().image_bytes(id)?;
+            let Some(raw) = raw else {
+                return Ok(Some(Response::Error { message: "selected item is not an image".into() }));
+            };
+            let captured = match clipd_core::resize_image_bytes(&raw, width, height, keep_aspect_ratio) {
+                Ok(c) => c,
+                Err(e) => return Ok(Some(Response::Error { message: e.to_string() })),
+            };
+            let offer_flavors = captured.flavors.clone();
             let item = {
                 let mut store = store.lock().unwrap();
-                let Some(captured) = store.resized_capture(id, width, height, keep_aspect_ratio)? else {
-                    return Ok(Some(Response::Error { message: "selected item is not an image".into() }));
-                };
                 let item = store.insert(captured, false)?;
                 if let Some(item) = &item {
                     hub.broadcast(&Event::Added { item: item.clone() });
                 }
                 item
             };
+            let (ack_tx, ack_rx) = sync_channel(1);
             if let Some(item) = item {
-                tx.send(Msg::Action(Action::Offer { id: item.id, paste: false, plain: false })).ok();
+                tx.send(Msg::Action(Action::Offer {
+                    id: item.id,
+                    paste: false,
+                    plain: false,
+                    ack: Some(ack_tx),
+                }))
+                .ok();
+            } else {
+                // Even if the resized image matched head_hash (e.g., clicking
+                // the same preset twice), still put it on the clipboard.
+                tx.send(Msg::Action(Action::OfferFlavors {
+                    flavors: offer_flavors,
+                    paste: false,
+                    ack: Some(ack_tx),
+                }))
+                .ok();
             }
-            Response::Ok
+            wait_ack(ack_rx)
         }
 
         Request::SetText { text, paste } => {
+            let bytes = text.into_bytes();
             let captured = Captured {
-                flavors: vec![("UTF8_STRING".into(), text.into_bytes())],
+                flavors: vec![
+                    ("text/plain;charset=utf-8".into(), bytes.clone()),
+                    ("UTF8_STRING".into(), bytes),
+                ],
                 source_app: None,
                 hinted_secret: false,
             };
             store.lock().unwrap().mark_head(&captured);
-            tx.send(Msg::Action(Action::OfferFlavors {
-                flavors: captured.flavors,
-                paste,
-            }))
-            .ok();
-            Response::Ok
+            let (ack_tx, ack_rx) = sync_channel(1);
+            if tx
+                .send(Msg::Action(Action::OfferFlavors {
+                    flavors: captured.flavors,
+                    paste,
+                    ack: Some(ack_tx),
+                }))
+                .is_err()
+            {
+                return Ok(Some(Response::Error { message: "daemon main loop stopped".into() }));
+            }
+            wait_ack(ack_rx)
         }
 
         Request::Delete { id } => {
@@ -291,4 +354,14 @@ fn handle(
         }
     };
     Ok(Some(response))
+}
+
+fn wait_ack(rx: std::sync::mpsc::Receiver<Result<(), String>>) -> Response {
+    match rx.recv_timeout(OFFER_ACK_TIMEOUT) {
+        Ok(Ok(())) => Response::Ok,
+        Ok(Err(message)) => Response::Error { message },
+        Err(_) => Response::Error {
+            message: "timed out waiting for clipboard backend to set selection".into(),
+        },
+    }
 }

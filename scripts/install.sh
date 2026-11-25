@@ -38,7 +38,11 @@ while [[ $# -gt 0 ]]; do
         --version) RELEASE_VERSION="${2:-}"; [[ -n "$RELEASE_VERSION" ]] || die "--version needs a value"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --no-launch) NO_LAUNCH=1; shift ;;
-        --status) dpkg-query -W -f='${Status} ${Version}\n' clipd 2>/dev/null || echo "clipd is not installed"; exit 0 ;;
+        --status)
+            dpkg-query -W -f='${Status} ${Version}\n' clipd 2>/dev/null || echo "clipd is not installed"
+            pgrep -a -x 'clipd|clipd-desktop' 2>/dev/null || echo "clipd is not running"
+            exit 0
+            ;;
         --uninstall) sudo apt-get remove -y clipd; exit $? ;;
         --help|-h) usage; exit 0 ;;
         *) die "unknown option: $1" ;;
@@ -103,25 +107,42 @@ import json, sys
 release = json.load(open(sys.argv[1], encoding="utf-8"))
 arch = sys.argv[2]
 assets = {asset["name"]: asset["browser_download_url"] for asset in release.get("assets", [])}
-deb = next((name for name in assets if name.startswith("clipd_") and name.endswith(f"_{arch}.deb")), None)
+# Prefer the versioned .deb (clipd_<ver>_<arch>.deb) over the version-less alias.
+deb = next(
+    (name for name in assets if name.startswith("clipd_") and name.endswith(f"_{arch}.deb") and name != f"clipd_{arch}.deb"),
+    None,
+) or next((name for name in assets if name == f"clipd_{arch}.deb"), None)
 checksums = next((name for name in assets if name == "SHA256SUMS"), None)
 if not deb or not checksums:
     raise SystemExit("release is missing the matching .deb or SHA256SUMS asset")
 print(deb)
 print(assets[deb])
 print(assets[checksums])
+print(release.get("tag_name", "").lstrip("v"))
 PY
 )" || die "release does not contain a $ARCH .deb and SHA256SUMS"
 
 DEB_NAME="$(sed -n '1p' <<<"$ASSETS")"
 DEB_URL="$(sed -n '2p' <<<"$ASSETS")"
 SUM_URL="$(sed -n '3p' <<<"$ASSETS")"
+TARGET_VER="$(sed -n '4p' <<<"$ASSETS")"
 DEB="$TMP/$DEB_NAME"
 SUMS="$TMP/SHA256SUMS"
+
+INSTALLED_VER="$(dpkg-query -W -f='${Version}\n' clipd 2>/dev/null || true)"
+if [[ -n "$INSTALLED_VER" && -n "$TARGET_VER" ]]; then
+    if [[ "$INSTALLED_VER" == "$TARGET_VER" ]]; then
+        info "Reinstalling clipd $TARGET_VER"
+    else
+        info "Updating clipd $INSTALLED_VER → $TARGET_VER"
+    fi
+fi
 
 info "Downloading $DEB_NAME"
 curl -fL --retry 3 --progress-bar -o "$DEB" "$DEB_URL"
 curl -fsSL --retry 3 -o "$SUMS" "$SUM_URL"
+chmod 755 "$TMP"
+chmod 644 "$DEB"
 
 HASH="$(awk -v file="$DEB_NAME" '$2 == file || $2 == "*" file { print $1; exit }' "$SUMS")"
 [[ "$HASH" =~ ^[0-9a-fA-F]{64}$ ]] || die "no SHA-256 entry found for $DEB_NAME"
@@ -133,18 +154,42 @@ if ((${#SESSION_PACKAGES[@]})); then
     info "Installing Wayland clipboard support: ${SESSION_PACKAGES[*]}"
     sudo apt-get install -y "${SESSION_PACKAGES[@]}"
 fi
-sudo apt install -y "$DEB"
-ok "clipd package installed"
+sudo env CLIPD_INSTALLER=1 apt install -y --reinstall "$DEB"
+ok "clipd ${TARGET_VER:-package} installed"
 
 if [[ "$NO_LAUNCH" == 0 ]]; then
+    # Stop old processes and wait for them to exit before relaunching, so
+    # clipd-session doesn't see a still-exiting process (or stale socket) and
+    # skip starting the newly installed binaries.
     pkill -x clipd-desktop 2>/dev/null || true
     pkill -x clipd 2>/dev/null || true
+    for _ in $(seq 1 30); do
+        if ! pgrep -x clipd >/dev/null 2>&1 && ! pgrep -x clipd-desktop >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.1
+    done
+    if pgrep -x clipd >/dev/null 2>&1 || pgrep -x clipd-desktop >/dev/null 2>&1; then
+        pkill -9 -x clipd-desktop 2>/dev/null || true
+        pkill -9 -x clipd 2>/dev/null || true
+        sleep 0.2
+    fi
+
     nohup /usr/bin/clipd-session >/dev/null 2>&1 < /dev/null &
     disown || true
+
+    # Wait briefly for the daemon socket and popup to come up.
+    SOCKET="${XDG_RUNTIME_DIR:-/tmp}/clipd.sock"
+    for _ in $(seq 1 30); do
+        [ -S "$SOCKET" ] && pgrep -x clipd-desktop >/dev/null 2>&1 && break
+        sleep 0.1
+    done
     ok "clipd started"
 fi
 
-printf '\n%s%sInstallation complete%s\n' "$BOLD" "$GREEN" "$RESET"
+ACTION_LABEL="Installation"
+[[ -n "$INSTALLED_VER" ]] && ACTION_LABEL="Update"
+printf '\n%s%s%s complete%s%s\n' "$BOLD" "$GREEN" "$ACTION_LABEL" "${TARGET_VER:+ (v$TARGET_VER)}" "$RESET"
 printf '  Session: %s\n' "$SESSION"
 printf '  Default shortcut: %sCtrl+Alt+C%s\n' "$CYAN" "$RESET"
 printf '  History: ~/.local/share/clipd\n'

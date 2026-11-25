@@ -13,7 +13,7 @@
 //! the `poll()` set wakes the loop without polling, which is what keeps idle
 //! CPU at literally zero.
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use clipd_core::Captured;
-use x11rb::connection::Connection;
+use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _, SelectionEventMask};
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
@@ -62,14 +62,16 @@ const PASSWORD_HINT: &str = "x-kde-passwordManagerHint";
 /// Flavors worth storing, in preference order.
 const WANTED: &[&str] = &[
     "image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp", "text/html", "text/uri-list",
-    "text/plain;charset=utf-8", "UTF8_STRING", "STRING", "TEXT",
+    "text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING", "TEXT",
 ];
 
 const TEXT_CAP: usize = 10 * 1024 * 1024;
 const IMAGE_CAP: usize = 50 * 1024 * 1024;
-/// How long to wait after handing focus back before injecting the keystroke.
-/// Measured at ~30 ms on GNOME 46; shorter and the key can land mid-switch.
-const FOCUS_SETTLE: Duration = Duration::from_millis(30);
+/// Initial settle before first focus check, and maximum wait while the WM
+/// hands focus back to the remembered window on X11.
+const FOCUS_SETTLE_INITIAL: Duration = Duration::from_millis(20);
+const FOCUS_SETTLE_MAX: Duration = Duration::from_millis(150);
+const FOCUS_POLL_STEP: Duration = Duration::from_millis(10);
 /// Minimum gap between two hotkey activations. Auto-repeat is filtered by its
 /// XI2 flag; this catches anything that slips past.
 const HOTKEY_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -80,11 +82,26 @@ struct Atoms {
     incr: Atom,
     timestamp: Atom,
     utf8: Atom,
+    text_plain_utf8: Atom,
+    text_plain: Atom,
     text: Atom,
     marker: Atom,
     hint: Atom,
     prop: Atom,
     active_window: Atom,
+    /// Pre-interned `WANTED` atoms in priority order — eliminates dozens of
+    /// `GetAtomName` X11 round-trips on every capture and poll tick.
+    wanted: Vec<(&'static str, Atom)>,
+}
+
+/// Pre-resolved clipboard flavors currently owned by `clipd`.
+///
+/// Building the target list and interning atoms once at `take_ownership` time
+/// keeps `serve()` free of X11 round-trips on every `SelectionRequest`.
+struct OwnedClipboard {
+    flavors: Vec<(Atom, Vec<u8>)>,
+    targets: Vec<Atom>,
+    best_text_index: Option<usize>,
 }
 
 /// Handle used by the daemon to drive the backend.
@@ -137,7 +154,7 @@ struct Backend {
     win: u32,
     atoms: Atoms,
     /// Flavors we are currently serving, when we own the clipboard.
-    owned: Option<Vec<(String, Vec<u8>)>>,
+    owned: Option<OwnedClipboard>,
     /// Window that had focus before the popup opened.
     remembered: u32,
     hotkey_keycode: Option<u8>,
@@ -146,10 +163,14 @@ struct Backend {
     /// Wayland session: capture and clipboard writes still work through
     /// XWayland, but nothing touching other windows does.
     wayland: bool,
-    /// (type, byte length) of the best-available flavor as of the last
-    /// capture, event-driven or polled — see `poll_check` for why this
-    /// exists at all.
-    last_seen: Option<(Atom, u32)>,
+    /// `(target_atom, property_type_atom, byte_length_or_incr_hint)` of the
+    /// best-available flavor as of the last capture or probe — shared state so
+    /// event-driven capture and the safety-net poll agree even for INCR payloads.
+    last_seen: Option<(Atom, Atom, u32)>,
+    /// X events observed while waiting inside `fetch` / `probe_size` / `read_incr`,
+    /// preserved here instead of being dropped so hotkeys, `SelectionClear`, and
+    /// `XfixesSelectionNotify` are never lost during a transfer.
+    pending_events: VecDeque<Event>,
 }
 
 impl Backend {
@@ -158,17 +179,25 @@ impl Backend {
         let root = screen.root;
         conn.xfixes_query_version(5, 0)?.reply()?;
 
+        let mut wanted = Vec::with_capacity(WANTED.len());
+        for &name in WANTED {
+            wanted.push((name, intern(&conn, name)?));
+        }
+
         let atoms = Atoms {
             clipboard: intern(&conn, "CLIPBOARD")?,
             targets: intern(&conn, "TARGETS")?,
             incr: intern(&conn, "INCR")?,
             timestamp: intern(&conn, "TIMESTAMP")?,
             utf8: intern(&conn, "UTF8_STRING")?,
+            text_plain_utf8: intern(&conn, "text/plain;charset=utf-8")?,
+            text_plain: intern(&conn, "text/plain")?,
             text: intern(&conn, "TEXT")?,
             marker: intern(&conn, SELF_MARKER)?,
             hint: intern(&conn, PASSWORD_HINT)?,
             prop: intern(&conn, "CLIPD_SEL")?,
             active_window: intern(&conn, "_NET_ACTIVE_WINDOW")?,
+            wanted,
         };
 
         let win = conn.generate_id()?;
@@ -204,6 +233,7 @@ impl Backend {
             last_hotkey: None,
             wayland: crate::is_wayland(),
             last_seen: None,
+            pending_events: VecDeque::new(),
         };
 
         if let Some(hk) = hotkey {
@@ -342,7 +372,13 @@ impl Backend {
             self.wayland.then(|| Instant::now() + POLL_CHECK_INTERVAL);
 
         loop {
-            // Drain anything already queued before sleeping.
+            // Drain events deferred while waiting inside a selection transfer,
+            // then anything already queued on the X connection, before sleeping.
+            while let Some(event) = self.pending_events.pop_front() {
+                if self.handle_event(event, signals)? {
+                    return Ok(());
+                }
+            }
             while let Some(event) = self.conn.poll_for_event()? {
                 if self.handle_event(event, signals)? {
                     return Ok(());
@@ -351,6 +387,9 @@ impl Backend {
             match self.drain_cmds(cmds, signals)? {
                 Flow::Stop => return Ok(()),
                 Flow::Continue => {}
+            }
+            if !self.pending_events.is_empty() {
+                continue;
             }
             self.conn.flush()?;
 
@@ -404,13 +443,26 @@ impl Backend {
                         eprintln!("clipd: could not focus popup: {e}");
                     }
                 }
-                Ok(Cmd::Offer { flavors }) => {
-                    self.take_ownership(flavors)?;
+                Ok(Cmd::Offer { flavors, ack }) => {
+                    let res = self.take_ownership(flavors).map_err(|e| e.to_string());
+                    if let Some(ack) = ack {
+                        let _ = ack.send(res);
+                    } else if let Err(e) = res {
+                        eprintln!("clipd: take_ownership failed: {e}");
+                    }
                 }
-                Ok(Cmd::Paste { flavors }) => {
-                    self.take_ownership(flavors)?;
-                    let injected = self.restore_focus_and_paste()?;
-                    let _ = signals.send(Signal::Pasted { injected });
+                Ok(Cmd::Paste { flavors, ack }) => {
+                    let res = self.take_ownership(flavors).map_err(|e| e.to_string());
+                    let ok = res.is_ok();
+                    if let Some(ack) = ack {
+                        let _ = ack.send(res);
+                    }
+                    if ok {
+                        let injected = self.restore_focus_and_paste()?;
+                        let _ = signals.send(Signal::Pasted { injected });
+                    } else {
+                        let _ = signals.send(Signal::Pasted { injected: false });
+                    }
                 }
                 Err(TryRecvError::Empty) => return Ok(Flow::Continue),
                 Err(TryRecvError::Disconnected) => return Ok(Flow::Stop),
@@ -428,7 +480,11 @@ impl Backend {
                     }
                 }
             }
-            Event::SelectionRequest(req) => self.serve(req)?,
+            Event::SelectionRequest(req) => {
+                if let Err(e) = self.serve(req) {
+                    eprintln!("clipd: failed to serve SelectionRequest: {e}");
+                }
+            }
             Event::SelectionClear(_) => {
                 // Someone else took the clipboard; stop advertising stale data.
                 self.owned = None;
@@ -479,7 +535,7 @@ impl Backend {
 
     fn capture(&mut self) -> Result<Option<Captured>> {
         let targets_raw = match self.fetch(self.atoms.targets)? {
-            Fetched::Data(_, d) => d,
+            Fetched::Data { data, .. } => data,
             _ => return Ok(None),
         };
         let atoms: Vec<Atom> = targets_raw
@@ -487,35 +543,31 @@ impl Backend {
             .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
-        let mut names: HashMap<String, Atom> = HashMap::new();
-        let mut hinted_secret = false;
-        for a in &atoms {
-            if *a == self.atoms.marker {
-                return Ok(None); // our own paste
-            }
-            if *a == self.atoms.hint {
-                hinted_secret = true;
-            }
-            if let Ok(reply) = self.conn.get_atom_name(*a)?.reply() {
-                names.insert(String::from_utf8_lossy(&reply.name).into_owned(), *a);
-            }
+        if atoms.contains(&self.atoms.marker) {
+            return Ok(None); // our own paste
         }
+        let hinted_secret = atoms.contains(&self.atoms.hint);
 
-        // Fetch every flavor we care about, so one copy keeps all its forms.
+        // Fetch every wanted flavor using pre-interned atoms (zero GetAtomName
+        // round-trips). `atoms.wanted` is already in priority order.
+        let wanted = self.atoms.wanted.clone();
         let mut flavors = Vec::new();
         let mut best_seen = None;
-        for want in WANTED {
-            let Some(atom) = names.get(*want) else { continue };
-            let Fetched::Data(ty, data) = self.fetch(*atom)? else { continue };
+        for (want, atom) in wanted {
+            if !atoms.contains(&atom) {
+                continue;
+            }
+            let Fetched::Data { data, probe_sig } = self.fetch(atom)? else {
+                continue;
+            };
+            // Record the probe signature for the first responsive WANTED target
+            // so `poll_check` compares against the exact same target & type
+            // (including INCR size hints) and never enters a re-fetch loop.
+            best_seen.get_or_insert((atom, probe_sig.0, probe_sig.1));
             let cap = if want.starts_with("image/") { IMAGE_CAP } else { TEXT_CAP };
             if data.is_empty() || data.len() > cap {
                 continue;
             }
-            // WANTED is priority order, so the first successful flavor is the
-            // one `poll_check`'s cheap probe compares future ticks against —
-            // shared state so a normal event-driven capture and the
-            // safety-net poll never fight over "did this already change".
-            best_seen.get_or_insert((ty, data.len() as u32));
             flavors.push((want.to_string(), data));
         }
         self.last_seen = best_seen.or(self.last_seen);
@@ -540,13 +592,19 @@ impl Backend {
     /// X traffic every tick here, not a re-transfer of the whole image.
     ///
     /// Only actually re-fetches (the real `capture()`, at real cost) when
-    /// that cheap signature changed from `last_seen` — a different type, or
-    /// a different size. Two distinct copies can in principle share both by
+    /// that cheap signature changed from `last_seen` — a different target,
+    /// type, or size. Two distinct copies can in principle share all three by
     /// coincidence and be missed; that's an acceptable miss for a safety net
     /// whose primary path is still the instant, event-driven one.
     fn poll_check(&mut self) -> Result<Option<Captured>> {
+        // When we currently own the X11 CLIPBOARD selection, polling ourselves
+        // is pointless; any foreign takeover sends SelectionClear first.
+        if self.owned.is_some() {
+            return Ok(None);
+        }
+
         let targets_raw = match self.fetch(self.atoms.targets)? {
-            Fetched::Data(_, d) => d,
+            Fetched::Data { data, .. } => data,
             _ => return Ok(None),
         };
         let atoms: Vec<Atom> = targets_raw
@@ -557,31 +615,53 @@ impl Backend {
             return Ok(None); // our own paste
         }
 
-        let mut names: HashMap<String, Atom> = HashMap::new();
-        for a in &atoms {
-            if let Ok(reply) = self.conn.get_atom_name(*a)?.reply() {
-                names.insert(String::from_utf8_lossy(&reply.name).into_owned(), *a);
-            }
-        }
-
-        let Some(atom) = WANTED.iter().find_map(|want| names.get(*want)) else {
+        let Some(&(_, atom)) = self.atoms.wanted.iter().find(|(_, a)| atoms.contains(a)) else {
             return Ok(None);
         };
-        let Some(signature) = self.probe_size(*atom)? else {
+        let Some((ty, size)) = self.probe_size(atom)? else {
             return Ok(None);
         };
 
+        let signature = (atom, ty, size);
         if self.last_seen == Some(signature) {
             return Ok(None);
         }
         self.capture()
     }
 
-    /// Negotiate `target` and return `(type, byte length)` without fetching
-    /// its content — the same zero-length `GetProperty` trick `fetch` itself
-    /// uses to size a transfer before doing it, stopped there instead of
-    /// going on to read the data.
-    fn probe_size(&self, target: Atom) -> Result<Option<(Atom, u32)>> {
+    /// Block until an X event is available or `deadline` passes, using
+    /// `poll(2)` on the X socket instead of a 200 us busy-sleep loop.
+    fn wait_x_event(&self, deadline: Instant) -> Result<Option<Event>> {
+        let x_fd = self.conn.stream().as_raw_fd();
+        loop {
+            if let Some(ev) = self.conn.poll_for_event()? {
+                return Ok(Some(ev));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let timeout_ms = remaining.as_millis().min(i32::MAX as u128).max(1) as i32;
+            let mut pfd = libc::pollfd { fd: x_fd, events: libc::POLLIN, revents: 0 };
+            let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err.into());
+            }
+            if n == 0 {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Negotiate `target` and return `(type, byte length / INCR size hint)`
+    /// without fetching its content — the same zero-length `GetProperty` trick
+    /// `fetch` itself uses to size a transfer before doing it, stopped there
+    /// instead of going on to read the data.
+    fn probe_size(&mut self, target: Atom) -> Result<Option<(Atom, u32)>> {
         self.conn.delete_property(self.win, self.atoms.prop)?;
         self.conn.convert_selection(
             self.win,
@@ -593,23 +673,39 @@ impl Backend {
         self.conn.flush()?;
 
         let deadline = Instant::now() + Duration::from_millis(300);
-        while Instant::now() < deadline {
-            let Some(event) = self.conn.poll_for_event()? else {
-                std::thread::sleep(Duration::from_micros(200));
-                continue;
-            };
+        while let Some(event) = self.wait_x_event(deadline)? {
             // Keep serving while probing, or two managers can deadlock.
-            if let Event::SelectionRequest(req) = &event {
-                self.serve(*req)?;
+            if let Event::SelectionRequest(req) = event {
+                let _ = self.serve(req);
                 continue;
             }
-            let Event::SelectionNotify(sn) = event else { continue };
+            let Event::SelectionNotify(sn) = event else {
+                self.pending_events.push_back(event);
+                continue;
+            };
+            if sn.selection != self.atoms.clipboard || sn.target != target {
+                continue;
+            }
             if sn.property == x11rb::NONE {
                 return Ok(None);
             }
             let probe =
                 self.conn.get_property(false, self.win, self.atoms.prop, AtomEnum::ANY, 0, 0)?.reply()?;
-            return Ok(Some((probe.type_, probe.bytes_after)));
+            let sig = if probe.type_ == self.atoms.incr {
+                // Read the 4-byte INCR lower-bound size hint and delete the
+                // property cleanly rather than leaving it hanging.
+                let hint_prop = self
+                    .conn
+                    .get_property(true, self.win, self.atoms.prop, AtomEnum::ANY, 0, 1)?
+                    .reply()?;
+                let hint = hint_prop.value32().and_then(|mut v| v.next()).unwrap_or(0);
+                (self.atoms.incr, hint)
+            } else {
+                let _ = self.conn.delete_property(self.win, self.atoms.prop);
+                (probe.type_, probe.bytes_after)
+            };
+            self.conn.flush()?;
+            return Ok(Some(sig));
         }
         Ok(None)
     }
@@ -648,7 +744,7 @@ impl Backend {
         None
     }
 
-    fn fetch(&self, target: Atom) -> Result<Fetched> {
+    fn fetch(&mut self, target: Atom) -> Result<Fetched> {
         self.conn.delete_property(self.win, self.atoms.prop)?;
         self.conn.convert_selection(
             self.win,
@@ -660,17 +756,19 @@ impl Backend {
         self.conn.flush()?;
 
         let deadline = Instant::now() + Duration::from_millis(3000);
-        while Instant::now() < deadline {
-            let Some(event) = self.conn.poll_for_event()? else {
-                std::thread::sleep(Duration::from_micros(200));
-                continue;
-            };
+        while let Some(event) = self.wait_x_event(deadline)? {
             // Keep serving while fetching, or two managers can deadlock.
-            if let Event::SelectionRequest(req) = &event {
-                self.serve(*req)?;
+            if let Event::SelectionRequest(req) = event {
+                let _ = self.serve(req);
                 continue;
             }
-            let Event::SelectionNotify(sn) = event else { continue };
+            let Event::SelectionNotify(sn) = event else {
+                self.pending_events.push_back(event);
+                continue;
+            };
+            if sn.selection != self.atoms.clipboard || sn.target != target {
+                continue;
+            }
             if sn.property == x11rb::NONE {
                 return Ok(Fetched::Refused);
             }
@@ -679,32 +777,40 @@ impl Backend {
                 self.conn.get_property(false, self.win, self.atoms.prop, AtomEnum::ANY, 0, 0)?.reply()?;
 
             if probe.type_ == self.atoms.incr {
-                return self.read_incr();
+                let hint_prop = self
+                    .conn
+                    .get_property(false, self.win, self.atoms.prop, AtomEnum::ANY, 0, 1)?
+                    .reply()?;
+                let hint = hint_prop.value32().and_then(|mut v| v.next()).unwrap_or(0);
+                return self.read_incr((self.atoms.incr, hint));
             }
+            let probe_sig = (probe.type_, probe.bytes_after);
             let words = probe.bytes_after.div_ceil(4);
             let full = self
                 .conn
                 .get_property(true, self.win, self.atoms.prop, AtomEnum::ANY, 0, words.max(1))?
                 .reply()?;
-            return Ok(Fetched::Data(full.type_, full.value));
+            return Ok(Fetched::Data { data: full.value, probe_sig });
         }
         Ok(Fetched::Timeout)
     }
 
     /// Chunked transfer for payloads too large for one request. Deleting the
     /// property acknowledges each chunk; a zero-length chunk ends the transfer.
-    fn read_incr(&self) -> Result<Fetched> {
+    fn read_incr(&mut self, probe_sig: (Atom, u32)) -> Result<Fetched> {
         self.conn.delete_property(self.win, self.atoms.prop)?;
         self.conn.flush()?;
         let mut buf = Vec::new();
-        let mut ty = AtomEnum::NONE.into();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            let Some(ev) = self.conn.poll_for_event()? else {
-                std::thread::sleep(Duration::from_micros(200));
+        while let Some(ev) = self.wait_x_event(deadline)? {
+            if let Event::SelectionRequest(req) = ev {
+                let _ = self.serve(req);
+                continue;
+            }
+            let Event::PropertyNotify(pn) = ev else {
+                self.pending_events.push_back(ev);
                 continue;
             };
-            let Event::PropertyNotify(pn) = ev else { continue };
             if pn.window != self.win
                 || pn.atom != self.atoms.prop
                 || pn.state != Property::NEW_VALUE
@@ -720,12 +826,11 @@ impl Backend {
                 .reply()?;
             self.conn.flush()?;
             if chunk.value.is_empty() {
-                return Ok(Fetched::Data(ty, buf));
+                return Ok(Fetched::Data { data: buf, probe_sig });
             }
-            ty = chunk.type_;
             buf.extend_from_slice(&chunk.value);
             if buf.len() > IMAGE_CAP {
-                return Ok(Fetched::Data(ty, buf));
+                return Ok(Fetched::Data { data: buf, probe_sig });
             }
         }
         Ok(Fetched::Timeout)
@@ -734,39 +839,80 @@ impl Backend {
     // ---- ownership -------------------------------------------------------
 
     fn take_ownership(&mut self, flavors: Vec<(String, Vec<u8>)>) -> Result<()> {
-        self.owned = Some(flavors);
+        let mut resolved = Vec::with_capacity(flavors.len());
+        let mut targets = vec![self.atoms.targets, self.atoms.timestamp, self.atoms.marker];
+        let mut best_text_index: Option<(usize, usize)> = None;
+
+        for (mime, data) in flavors {
+            let idx = resolved.len();
+            // Pick the highest-priority plain-text flavor for serving all text
+            // aliases (`UTF8_STRING`, `text/plain;charset=utf-8`, `text/plain`,
+            // `TEXT`, `STRING`) so both X11 and native Wayland apps (via
+            // XWayland's clipboard bridge) always find a MIME type they accept.
+            let text_rank = match mime.as_str() {
+                "UTF8_STRING" => Some(0),
+                "text/plain;charset=utf-8" => Some(1),
+                "text/plain" => Some(2),
+                "STRING" => Some(3),
+                "TEXT" => Some(4),
+                _ => None,
+            };
+            if let Some(rank) = text_rank {
+                if best_text_index.is_none_or(|(_, best)| rank < best) {
+                    best_text_index = Some((idx, rank));
+                }
+            }
+
+            let atom = intern(&self.conn, &mime)?;
+            if !targets.contains(&atom) {
+                targets.push(atom);
+            }
+            resolved.push((atom, data));
+        }
+
+        let best_text_index = best_text_index.map(|(idx, _)| idx);
+        if best_text_index.is_some() {
+            for atom in [
+                self.atoms.utf8,
+                self.atoms.text_plain_utf8,
+                self.atoms.text_plain,
+                self.atoms.text,
+                Atom::from(AtomEnum::STRING),
+            ] {
+                if !targets.contains(&atom) {
+                    targets.push(atom);
+                }
+            }
+        }
+
+        self.owned = Some(OwnedClipboard {
+            flavors: resolved,
+            targets,
+            best_text_index,
+        });
         self.conn
             .set_selection_owner(self.win, self.atoms.clipboard, Time::CURRENT_TIME)?;
         self.conn.flush()?;
+        // Sync round-trip so the X server / XWayland has definitely processed
+        // `SetSelectionOwner` before we acknowledge the daemon's caller.
+        let _ = self.conn.get_selection_owner(self.atoms.clipboard)?.reply();
         Ok(())
     }
 
     fn serve(&self, req: x11rb::protocol::xproto::SelectionRequestEvent) -> Result<()> {
-        let Some(flavors) = &self.owned else {
+        let Some(owned) = &self.owned else {
             return self.refuse(req);
         };
         // Obsolete clients send property=None meaning "use the target".
         let prop = if req.property == x11rb::NONE { req.target } else { req.property };
-        let name = atom_name(&self.conn, req.target);
 
         let ok = if req.target == self.atoms.targets {
-            let mut offer = vec![self.atoms.targets, self.atoms.timestamp, self.atoms.marker];
-            for (mime, _) in flavors {
-                if let Ok(a) = intern(&self.conn, mime) {
-                    offer.push(a);
-                }
-                // Text flavors also answer to the legacy atoms.
-                if mime == "UTF8_STRING" {
-                    offer.push(self.atoms.text);
-                    offer.push(AtomEnum::STRING.into());
-                }
-            }
             self.conn.change_property32(
                 PropMode::REPLACE,
                 req.requestor,
                 prop,
                 AtomEnum::ATOM,
-                &offer,
+                &owned.targets,
             )?;
             true
         } else if req.target == self.atoms.timestamp {
@@ -782,27 +928,46 @@ impl Backend {
             self.conn.change_property8(PropMode::REPLACE, req.requestor, prop, req.target, b"1")?;
             true
         } else {
-            // Legacy text atoms map onto our UTF8 flavor.
-            let lookup = if req.target == self.atoms.text
-                || req.target == Atom::from(AtomEnum::STRING)
-                || req.target == self.atoms.utf8
-            {
-                flavors
-                    .iter()
-                    .find(|(m, _)| m == "UTF8_STRING" || m == "text/plain;charset=utf-8")
-            } else {
-                flavors.iter().find(|(m, _)| *m == name)
-            };
-            match lookup {
-                Some((_, data)) => {
-                    self.conn.change_property8(
-                        PropMode::REPLACE,
-                        req.requestor,
-                        prop,
-                        req.target,
-                        data,
-                    )?;
-                    true
+            let is_text_target = req.target == self.atoms.utf8
+                || req.target == self.atoms.text_plain_utf8
+                || req.target == self.atoms.text_plain
+                || req.target == self.atoms.text
+                || req.target == Atom::from(AtomEnum::STRING);
+
+            let data = owned
+                .flavors
+                .iter()
+                .find(|(atom, _)| *atom == req.target)
+                .map(|(_, data)| data.as_slice())
+                .or_else(|| {
+                    if is_text_target {
+                        owned.best_text_index.map(|i| owned.flavors[i].1.as_slice())
+                    } else {
+                        None
+                    }
+                });
+
+            match data {
+                Some(data) => {
+                    // Guard against crashing the backend on payloads exceeding
+                    // the X server's maximum single request length.
+                    let max_bytes = self.conn.maximum_request_bytes();
+                    if data.len().saturating_add(64) > max_bytes {
+                        eprintln!(
+                            "clipd: payload ({} bytes) exceeds X11 max request size ({max_bytes} bytes)",
+                            data.len()
+                        );
+                        false
+                    } else {
+                        self.conn.change_property8(
+                            PropMode::REPLACE,
+                            req.requestor,
+                            prop,
+                            req.target,
+                            data,
+                        )?;
+                        true
+                    }
                 }
                 None => false,
             }
@@ -845,18 +1010,21 @@ impl Backend {
     /// indication is allowed to bypass that — the same mechanism that makes
     /// focus restore work after a paste.
     fn focus_popup(&self) -> Result<()> {
-        // Used to skip this entirely on a Wayland session: the popup was a
-        // native Wayland surface with no X11 window to activate, so trying
-        // just logged "popup window not mapped" on every single open.
-        //
-        // That's no longer true. clipd-session now launches clipd-desktop
-        // with GDK_BACKEND=x11 (see its comment for why — window positioning
-        // needed it too), so the popup is *always* a real XWayland window
-        // now, discoverable here exactly like any other X11 client, on X11
-        // and Wayland sessions alike. `self.wayland` reflects the session
-        // type, not this window's own backend, so gating on it here was
-        // right before that change and wrong after it.
-        //
+        // On Wayland + GNOME (e.g. Mutter 46 where clipd falls back to this X11
+        // backend because wl-paste lacks data-control), GNOME Shell's extension
+        // can activate the XWayland popup directly inside Mutter without being
+        // blocked by focus-stealing prevention. Retry briefly while the window
+        // maps, then fall back to EWMH `_NET_ACTIVE_WINDOW`.
+        if self.wayland && crate::shell_ext::is_available() {
+            for attempt in 0..6 {
+                if crate::shell_ext::focus_popup().is_ok() {
+                    return Ok(());
+                }
+                if attempt < 5 {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
         activate_popup(&self.conn, self.root, self.atoms.active_window)
     }
 
@@ -875,7 +1043,7 @@ impl Backend {
     fn restore_focus_and_paste(&mut self) -> Result<bool> {
         // XTEST reaches only XWayland clients and EWMH cannot address Wayland
         // windows, so injection is impossible here. Report it immediately
-        // rather than burning 30 ms to arrive at the same answer.
+        // rather than burning time to arrive at the same answer.
         if self.wayland {
             return Ok(false);
         }
@@ -903,14 +1071,21 @@ impl Backend {
         let _ = self.conn.set_input_focus(InputFocus::PARENT, target, Time::CURRENT_TIME);
         self.conn.flush()?;
 
-        std::thread::sleep(FOCUS_SETTLE);
-
-        // A synthetic Ctrl+V goes wherever focus is. If restore failed, sending
-        // it would paste into an unrelated document — leave the content on the
-        // clipboard and let the user paste manually instead.
-        let focused = self.conn.get_input_focus()?.reply()?.focus;
-        if !self.focus_belongs_to(focused, target) {
-            return Ok(false);
+        // A synthetic Ctrl+V goes wherever focus is. Poll until focus lands on
+        // the intended window (up to FOCUS_SETTLE_MAX) instead of giving up
+        // after one fixed sleep — faster when the WM is quick, and far less
+        // flaky when it takes 50-100ms.
+        std::thread::sleep(FOCUS_SETTLE_INITIAL);
+        let deadline = Instant::now() + FOCUS_SETTLE_MAX.saturating_sub(FOCUS_SETTLE_INITIAL);
+        loop {
+            let focused = self.conn.get_input_focus()?.reply()?.focus;
+            if self.focus_belongs_to(focused, target) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(FOCUS_POLL_STEP);
         }
 
         let kc_v = keycode_for(&self.conn, KEYSYM_V)?.ok_or_else(|| anyhow!("no 'v' keycode"))?;
@@ -1031,6 +1206,7 @@ fn find_popup_window(conn: &RustConnection, root: u32) -> Result<Option<u32>> {
         .map(|iter| iter.collect())
         .unwrap_or_default();
 
+    let mut title_fallback = None;
     for win in windows {
         let title = conn
             .get_property(false, win, net_wm_name, utf8, 0, 256)?
@@ -1043,11 +1219,21 @@ fn find_popup_window(conn: &RustConnection, root: u32) -> Result<Option<u32>> {
                     .and_then(|c| c.reply().ok())
                     .and_then(|p| String::from_utf8(p.value).ok())
             });
-        if title.as_deref() == Some("Clipboard") {
+        if title.as_deref() != Some("Clipboard") {
+            continue;
+        }
+        let wm_class = conn
+            .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 128)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|p| String::from_utf8_lossy(&p.value).to_ascii_lowercase())
+            .unwrap_or_default();
+        if wm_class.contains("clipd-desktop") {
             return Ok(Some(win));
         }
+        title_fallback.get_or_insert(win);
     }
-    Ok(None)
+    Ok(title_fallback)
 }
 
 fn focus_belongs_to(conn: &RustConnection, mut focus: u32, target: u32) -> bool {
@@ -1071,23 +1257,15 @@ enum Flow {
 }
 
 enum Fetched {
-    /// Payload, with the type atom the owner replied with. The type is not used
-    /// today but is kept because INCR and compound-text handling need it.
-    Data(#[allow(dead_code)] Atom, Vec<u8>),
+    /// Payload plus the `(type, size_or_incr_hint)` signature observed on the
+    /// initial property probe so `poll_check` agrees with event-driven capture.
+    Data { data: Vec<u8>, probe_sig: (Atom, u32) },
     Refused,
     Timeout,
 }
 
 fn intern(conn: &RustConnection, name: &str) -> Result<Atom> {
     Ok(conn.intern_atom(false, name.as_bytes())?.reply()?.atom)
-}
-
-fn atom_name(conn: &RustConnection, atom: Atom) -> String {
-    conn.get_atom_name(atom)
-        .ok()
-        .and_then(|c| c.reply().ok())
-        .map(|r| String::from_utf8_lossy(&r.name).into_owned())
-        .unwrap_or_default()
 }
 
 fn keycode_for(conn: &RustConnection, keysym: u32) -> Result<Option<u8>> {

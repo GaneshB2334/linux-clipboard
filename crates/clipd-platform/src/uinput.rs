@@ -73,6 +73,12 @@ const DEVICE_READY_TIMEOUT: Duration = Duration::from_secs(2);
 const DEVICE_READY_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const DEVICE_DISCOVERY_GRACE: Duration = Duration::from_millis(100);
 
+/// Small inter-event pause between modifier press, key press, key release, and
+/// modifier release. Giving the compositor a few milliseconds between each step
+/// ensures the Ctrl modifier latches before V arrives and prevents Wayland /
+/// XWayland / Electron apps from dropping a 0 ms press-release pair.
+const KEY_STEP_DELAY: Duration = Duration::from_millis(12);
+
 /// Is `/dev/uinput` writable by us right now?
 ///
 /// A permission check, not a device creation — this is called before every
@@ -208,20 +214,47 @@ impl UinputDevice {
     }
 
     fn send_ctrl_v(&mut self) -> Result<()> {
-        let events = [
-            // One write call makes Ctrl and V land in the same input frame;
-            // separate writes leave a scheduling window where the compositor
-            // can process a bare V before Ctrl arrives.
+        // Send each transition with its own SYN_REPORT and a short settle delay:
+        //   1. Press Ctrl  (latch modifier in compositor/XKB state)
+        //   2. Press V
+        //   3. Release V
+        //   4. Release Ctrl
+        // Writing all 6 events in one 0 ms burst lets some Wayland/XWayland and
+        // Electron clients coalesce or drop the tap before Ctrl propagates.
+        self.write_events(&[
             input_event(EV_KEY, KEY_LEFTCTRL, 1),
+            input_event(EV_SYN, SYN_REPORT, 0),
+        ])?;
+        std::thread::sleep(KEY_STEP_DELAY);
+
+        let v_press = self.write_events(&[
             input_event(EV_KEY, KEY_V, 1),
             input_event(EV_SYN, SYN_REPORT, 0),
+        ]);
+        if v_press.is_ok() {
+            std::thread::sleep(KEY_STEP_DELAY);
+        }
+        let v_release = self.write_events(&[
             input_event(EV_KEY, KEY_V, 0),
+            input_event(EV_SYN, SYN_REPORT, 0),
+        ]);
+        std::thread::sleep(KEY_STEP_DELAY);
+        // Always attempt to release Left Ctrl even if an earlier write errored,
+        // so the user is never left with a stuck Ctrl modifier.
+        let ctrl_release = self.write_events(&[
             input_event(EV_KEY, KEY_LEFTCTRL, 0),
             input_event(EV_SYN, SYN_REPORT, 0),
-        ];
+        ]);
+
+        v_press?;
+        v_release?;
+        ctrl_release
+    }
+
+    fn write_events(&mut self, events: &[libc::input_event]) -> Result<()> {
         use std::io::Write;
         self.file
-            .write_all(input_events_as_bytes(&events))
+            .write_all(input_events_as_bytes(events))
             .context("writing uinput key events")
     }
 }
@@ -251,16 +284,34 @@ fn wait_for_device_node(device_name: &str) -> Result<PathBuf> {
 }
 
 fn find_device_node(device_name: &str) -> Option<PathBuf> {
-    for entry in std::fs::read_dir("/sys/class/input").ok()?.flatten() {
-        let name = std::fs::read_to_string(entry.path().join("name")).ok()?;
+    find_device_node_in(Path::new("/sys/class/input"), Path::new("/dev/input"), device_name)
+}
+
+fn find_device_node_in(sys_input: &Path, dev_input: &Path, device_name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(sys_input).ok()?;
+    for entry in entries.flatten() {
+        // `/sys/class/input` mixes `event*`, `mouse*`, `mice`, and `input*`
+        // symlinks. Only `input*` directories carry a `name` attribute — using
+        // `?` on `read_to_string` previously aborted the entire scan on the
+        // very first `event*` entry, making device creation time out every time.
+        let entry_name = entry.file_name();
+        if !entry_name.to_string_lossy().starts_with("input") {
+            continue;
+        }
+        let Ok(name) = std::fs::read_to_string(entry.path().join("name")) else {
+            continue;
+        };
         if name.trim() != device_name {
             continue;
         }
-        for child in std::fs::read_dir(entry.path()).ok()?.flatten() {
+        let Ok(children) = std::fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for child in children.flatten() {
             let file_name = child.file_name();
             let file_name = file_name.to_string_lossy();
             if file_name.starts_with("event") {
-                let path = Path::new("/dev/input").join(file_name.as_ref());
+                let path = dev_input.join(file_name.as_ref());
                 if path.exists() {
                     return Some(path);
                 }
@@ -292,4 +343,36 @@ fn input_events_as_bytes(events: &[libc::input_event]) -> &[u8] {
 
 fn last_os_error(context: &str) -> anyhow::Error {
     anyhow!("{context}: {}", std::io::Error::last_os_error())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_device_node_skips_non_input_entries_without_name_file() {
+        let base = std::env::temp_dir().join(format!(
+            "clipd-uinput-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sys = base.join("sys");
+        let dev = base.join("dev");
+        std::fs::create_dir_all(sys.join("event0")).unwrap();
+        std::fs::create_dir_all(sys.join("mice")).unwrap();
+        std::fs::create_dir_all(sys.join("input0")).unwrap();
+        std::fs::write(sys.join("input0/name"), "Other Keyboard\n").unwrap();
+        std::fs::create_dir_all(sys.join("input24/event13")).unwrap();
+        std::fs::write(sys.join("input24/name"), "clipd-paste-1234\n").unwrap();
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::write(dev.join("event13"), b"").unwrap();
+
+        let found = find_device_node_in(&sys, &dev, "clipd-paste-1234");
+        assert_eq!(found, Some(dev.join("event13")));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
