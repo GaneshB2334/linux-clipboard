@@ -9,12 +9,12 @@
 use clipd_ipc::Kind;
 
 /// Classify a copy from its best MIME type and payload.
+///
+/// Rich-text (`text/html`) copies keep their `text/html` flavor for pasting,
+/// but classify from their readable text content rather than as an HTML file.
 pub fn kind_of(mime: &str, data: &[u8]) -> Kind {
     if mime.starts_with("image/") {
         return Kind::Image;
-    }
-    if mime == "text/html" {
-        return Kind::Html;
     }
     if mime == "text/uri-list" {
         return Kind::Files;
@@ -22,6 +22,15 @@ pub fn kind_of(mime: &str, data: &[u8]) -> Kind {
     let Ok(text) = std::str::from_utf8(data) else {
         return Kind::Text;
     };
+    if mime == "text/html" {
+        let stripped = strip_html_to_text(text);
+        return kind_of_text(&stripped);
+    }
+    kind_of_text(text)
+}
+
+/// Classify plain text content (URL, color, code, or plain text).
+pub fn kind_of_text(text: &str) -> Kind {
     let t = text.trim();
     if t.is_empty() {
         return Kind::Text;
@@ -36,6 +45,108 @@ pub fn kind_of(mime: &str, data: &[u8]) -> Kind {
         return Kind::Code;
     }
     Kind::Text
+}
+
+/// Convert raw HTML markup into clean readable text for previews and
+/// classification (never showing `<meta>`/`<span>` tags in history).
+pub fn strip_html_to_text(html: &str) -> String {
+    let bytes = html.as_bytes();
+    let mut out = String::with_capacity(html.len().min(4096));
+    let mut i = 0;
+    let mut skip_end_tag: Option<&[u8]> = None;
+
+    while i < bytes.len() {
+        if let Some(end_tag) = skip_end_tag {
+            if bytes[i] == b'<'
+                && bytes.len() - i >= end_tag.len()
+                && bytes[i..i + end_tag.len()].eq_ignore_ascii_case(end_tag)
+            {
+                i += end_tag.len();
+                while i < bytes.len() && bytes[i] != b'>' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+                skip_end_tag = None;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        if bytes[i] == b'<' {
+            let tag_start = i + 1;
+            let rest = &bytes[i..];
+            if rest.len() >= 7 && rest[..7].eq_ignore_ascii_case(b"<script") {
+                skip_end_tag = Some(b"</script");
+            } else if rest.len() >= 6 && rest[..6].eq_ignore_ascii_case(b"<style") {
+                skip_end_tag = Some(b"</style");
+            } else if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case(b"<head") {
+                skip_end_tag = Some(b"</head");
+            }
+            // Advance past the closing '>' of this tag.
+            while i < bytes.len() && bytes[i] != b'>' {
+                i += 1;
+            }
+            let tag_end = i;
+            if i < bytes.len() {
+                i += 1;
+            }
+            // Only insert separating whitespace for block-level tags so inline
+            // formatting (`<b>world</b>!`) doesn't introduce stray spaces.
+            if is_block_tag(&html[tag_start..tag_end]) && !out.ends_with(' ') && !out.is_empty() {
+                out.push(' ');
+            }
+            continue;
+        }
+
+        if bytes[i] == b'&' {
+            if let Some(semi_rel) = bytes[i..].iter().take(12).position(|&b| b == b';') {
+                let entity = &html[i + 1..i + semi_rel];
+                if let Some(decoded) = decode_html_entity(entity) {
+                    out.push(decoded);
+                    i += semi_rel + 1;
+                    continue;
+                }
+            }
+        }
+
+        let ch = html[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_block_tag(raw_tag: &str) -> bool {
+    let trimmed = raw_tag.trim().trim_start_matches('/');
+    let name = trimmed
+        .split(|c: char| c.is_ascii_whitespace() || c == '/')
+        .next()
+        .unwrap_or("");
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "p" | "div" | "br" | "li" | "tr" | "td" | "th" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+            | "blockquote" | "pre" | "hr" | "section" | "article" | "header" | "footer"
+    )
+}
+
+fn decode_html_entity(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some(' '),
+        _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+            u32::from_str_radix(&entity[2..], 16).ok().and_then(char::from_u32)
+        }
+        _ if entity.starts_with('#') => entity[1..].parse::<u32>().ok().and_then(char::from_u32),
+        _ => None,
+    }
 }
 
 /// Payloads at or above this are skipped rather than read into memory —
@@ -271,7 +382,16 @@ mod tests {
         assert_eq!(kind_of("UTF8_STRING", b"const app = express()"), Kind::Code);
         assert_eq!(kind_of("UTF8_STRING", b"just some prose here"), Kind::Text);
         assert_eq!(kind_of("image/png", b"\x89PNG"), Kind::Image);
-        assert_eq!(kind_of("text/html", b"<b>hi</b>"), Kind::Html);
+        assert_eq!(kind_of("text/html", b"<b>hi</b>"), Kind::Text);
+    }
+
+    #[test]
+    fn strips_html_markup_to_clean_text() {
+        assert_eq!(
+            strip_html_to_text("<meta charset=\"utf-8\"><style>.x{color:red}</style><p>Hello &amp; <b>world</b>!</p><p>Next</p>"),
+            "Hello & world! Next"
+        );
+        assert_eq!(strip_html_to_text("<span>a&nbsp;b&#39;c</span>"), "a b'c");
     }
 
     #[test]

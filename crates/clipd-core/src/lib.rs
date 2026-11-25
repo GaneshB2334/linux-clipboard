@@ -265,12 +265,27 @@ mod tests {
         };
         let item = s.insert(from_browser, false).unwrap().unwrap();
         assert_eq!(item.preview, "hello world");
+        assert_eq!(item.kind, clipd_ipc::Kind::Text, "rich text should not show as an html file");
+        assert!(
+            s.flavors(item.id).unwrap().iter().any(|(m, _)| m == "text/html"),
+            "text/html flavor must be preserved for rich paste"
+        );
 
         // GNOME hand-off drops text/html and re-offers plain text only.
         assert!(
             s.insert(text_capture("hello world"), false).unwrap().is_none(),
             "re-offer without text/html must dedupe against the HTML+plain copy"
         );
+
+        // HTML-only copy without a plain-text flavor still gets a clean text preview.
+        let html_only = Captured {
+            flavors: vec![("text/html".into(), b"<p><b>Bold</b> &amp; clean</p>".to_vec())],
+            source_app: None,
+            hinted_secret: false,
+        };
+        let clean = s.insert(html_only, false).unwrap().unwrap();
+        assert_eq!(clean.kind, clipd_ipc::Kind::Text);
+        assert_eq!(clean.preview, "Bold & clean");
     }
 
     #[test]

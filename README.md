@@ -68,8 +68,7 @@ cargo build --release
   full-text search over everything older merged in behind it
 - **Every format of a copy is kept** (`text/html` + plain text + image), so
   "paste as plain text" still works long after the copy
-- **Images**, with real thumbnails, dimensions, and a resize-and-copy action
-  right from the preview pane
+- **Images**, with crisp inline thumbnails and a larger preview pane showing dimensions and metadata
 - **Copying an image file works too** — Ctrl+C on a file in a file manager,
   not just an image element in a browser, ends up in history as a real image
 - **Secrets are dropped, not hidden.** The `x-kde-passwordManagerHint` MIME

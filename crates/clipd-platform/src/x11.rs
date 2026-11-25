@@ -1013,12 +1013,22 @@ impl Backend {
         // On Wayland + GNOME (e.g. Mutter 46 where clipd falls back to this X11
         // backend because wl-paste lacks data-control), GNOME Shell's extension
         // can activate the XWayland popup directly inside Mutter without being
-        // blocked by focus-stealing prevention. Retry briefly while the window
-        // maps, then fall back to EWMH `_NET_ACTIVE_WINDOW`.
+        // blocked by focus-stealing prevention. Verify focus actually landed on
+        // the popup via X11 before trusting it; otherwise fall back to EWMH.
         if self.wayland && crate::shell_ext::is_available() {
             for attempt in 0..6 {
                 if crate::shell_ext::focus_popup().is_ok() {
-                    return Ok(());
+                    std::thread::sleep(Duration::from_millis(20));
+                    if let Ok(Some(win)) = find_popup_window(&self.conn, self.root) {
+                        if let Ok(reply) = self.conn.get_input_focus().and_then(|c| Ok(c.reply())) {
+                            if let Ok(reply) = reply {
+                                if focus_belongs_to(&self.conn, reply.focus, win) {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                    break;
                 }
                 if attempt < 5 {
                     std::thread::sleep(Duration::from_millis(25));

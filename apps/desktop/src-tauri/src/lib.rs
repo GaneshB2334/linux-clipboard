@@ -334,6 +334,7 @@ fn toggle(window: &WebviewWindow) {
             // data-tauri-drag-region — there's no title bar) actually stick
             // between opens instead of snapping back every toggle.
             let _ = window.show();
+            let _ = window.set_focus();
             let _ = window.emit("clipd://opened", ());
 
             // `set_focus` alone is not enough: it maps onto GTK's `present()`,

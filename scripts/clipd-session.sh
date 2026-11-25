@@ -59,7 +59,7 @@ else
   # dragging the popup and having it remember where it was left both need a
   # real position, which only XWayland provides. Harmless on an X11 session:
   # XWayland is already what X11 *is* there, so this is a no-op.
-  GDK_BACKEND=x11 "$BIN/clipd-desktop" >> "$LOGDIR/ui.log" 2>&1 &
+  GDK_BACKEND=x11 GTK_IM_MODULE=gtk-im-context-simple "$BIN/clipd-desktop" >> "$LOGDIR/ui.log" 2>&1 &
 fi
 
 wait

@@ -5,40 +5,28 @@ import { useEffect, useState } from "react";
 import {
   AppWindow,
   CalendarClock,
-  Copy,
   Database,
   EyeOff,
   FileType2,
   History,
   Image as ImageIcon,
-  Layers3,
   LoaderCircle,
-  Scaling,
   type LucideIcon,
 } from "lucide-react";
 import type { Item } from "./api";
 import { api, getCachedThumbnail } from "./api";
 
 /**
- * Detail pane for the selected row.
- *
- * Exists so the list can stay dense: truncated one-liners are fine when the
- * full content is always visible next to them, and it removes the guesswork
- * about which of three similar-looking items is the one you want.
+ * Detail pane for the selected image row — shows a larger preview along with
+ * dimensions, size, and copy metadata.
  */
-export function Preview({ item, onMessage }: { item: Item; onMessage?: (message: string) => void }) {
+export function Preview({ item }: { item: Item }) {
   const [imageSrc, setImageSrc] = useState(() => getCachedThumbnail(item.id) ?? "");
   const [loading, setLoading] = useState(
     () => item.kind === "image" && item.has_thumbnail && !getCachedThumbnail(item.id),
   );
-  const [customWidth, setCustomWidth] = useState("");
-  const [customHeight, setCustomHeight] = useState("");
-  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    setCustomWidth("");
-    setCustomHeight("");
-
     const cached = getCachedThumbnail(item.id);
     if (cached !== undefined) {
       setImageSrc(cached);
@@ -68,25 +56,13 @@ export function Preview({ item, onMessage }: { item: Item; onMessage?: (message:
     };
   }, [item.id, item.kind, item.has_thumbnail]);
 
-  const parsedWidth = Number(customWidth);
-  const parsedHeight = customHeight ? Number(customHeight) : undefined;
-  const customValid = parsedWidth > 0 && (parsedHeight === undefined || parsedHeight > 0);
-
-  const resize = async (width: number, height?: number) => {
-    if (width <= 0 || (height !== undefined && height <= 0)) return;
-    setBusy(true);
-    try {
-      await api.resizeCopy(item.id, width, height);
-      onMessage?.(height ? `Copied resized image at ${width} × ${height}px` : `Copied resized image at ${width}px`);
-    } catch (error) {
-      onMessage?.(String(error));
-    } finally {
-      setBusy(false);
-    }
-  };
+  const typeLabel =
+    item.kind === "html" || (item.kind === "text" && item.mimes.includes("text/html"))
+      ? "rich text"
+      : item.kind;
 
   return (
-    <aside className="ios-preview hidden w-[280px] shrink-0 flex-col gap-3 overflow-y-auto border-l border-black/[0.055] p-4 sm:flex dark:border-white/[0.07]">
+    <aside className="ios-preview hidden w-[310px] shrink-0 flex-col gap-3 overflow-y-auto border-l border-black/[0.055] p-3.5 sm:flex dark:border-white/[0.07]">
       {item.sensitive ? (
         <div className="flex gap-2.5 rounded-xl bg-amber-500/10 p-3 text-xs text-amber-900 dark:text-amber-200">
           <EyeOff className="mt-0.5 size-4 shrink-0" strokeWidth={1.8} />
@@ -98,20 +74,24 @@ export function Preview({ item, onMessage }: { item: Item; onMessage?: (message:
         </div>
       ) : item.kind === "image" ? (
         <>
-          <div className="overflow-hidden rounded-xl bg-black/[0.04] dark:bg-white/[0.055]">
+          <div className="flex flex-1 min-h-[180px] items-center justify-center overflow-hidden rounded-xl bg-black/[0.04] p-1.5 dark:bg-white/[0.055]">
             {imageSrc ? (
-              <img src={imageSrc} alt="Clipboard preview" className="max-h-48 w-full object-contain" />
+              <img
+                src={imageSrc}
+                alt="Clipboard preview"
+                className="max-h-[260px] w-full rounded-lg object-contain"
+              />
             ) : loading ? (
-              <div className="grid h-32 place-items-center text-neutral-400" aria-label="Loading preview">
+              <div className="grid h-44 place-items-center text-neutral-400" aria-label="Loading preview">
                 <LoaderCircle className="size-5 animate-spin" strokeWidth={1.8} />
               </div>
             ) : (
-              <div className="grid h-32 place-items-center text-neutral-400" aria-label="No preview available">
+              <div className="grid h-44 place-items-center text-neutral-400" aria-label="No preview available">
                 <ImageIcon className="size-6" strokeWidth={1.8} />
               </div>
             )}
           </div>
-          <div className="flex items-center gap-1.5 text-xs text-neutral-500">
+          <div className="flex items-center gap-1.5 text-xs text-neutral-500 dark:text-neutral-400">
             <ImageIcon className="size-3.5" strokeWidth={1.8} />
             {item.image_width && item.image_height
               ? `${item.image_width} × ${item.image_height} · `
@@ -122,7 +102,7 @@ export function Preview({ item, onMessage }: { item: Item; onMessage?: (message:
       ) : (
         <p
           className={[
-            "max-h-48 overflow-y-auto whitespace-pre-wrap break-words text-xs leading-relaxed",
+            "max-h-56 overflow-y-auto whitespace-pre-wrap break-words text-xs leading-relaxed",
             item.kind === "code" ? "font-mono" : "",
           ].join(" ")}
         >
@@ -137,88 +117,12 @@ export function Preview({ item, onMessage }: { item: Item; onMessage?: (message:
         />
       )}
 
-      {item.kind === "image" && (
-        <div className="rounded-xl bg-black/[0.035] p-3 dark:bg-white/[0.05]">
-          <div className="mb-2 flex items-center gap-1.5 text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
-            <Scaling className="size-3.5" strokeWidth={1.8} />
-            Resize & copy
-          </div>
-          <div className="grid grid-cols-2 gap-1.5">
-            {[25, 50].map((percent) => (
-              <button
-                key={percent}
-                type="button"
-                disabled={busy || !item.image_width}
-                onClick={() => resize(Math.max(1, Math.round((item.image_width ?? 1) * percent / 100)))}
-                className="rounded-lg bg-black/[0.05] px-2 py-1.5 text-[11px] text-neutral-600 transition hover:bg-black/[0.1] disabled:opacity-40 dark:bg-white/[0.08] dark:text-neutral-300 dark:hover:bg-white/[0.14]"
-              >
-                {percent}%
-              </button>
-            ))}
-            {[1024, 1920].map((width) => (
-              <button
-                key={width}
-                type="button"
-                disabled={busy || !item.image_width}
-                onClick={() => resize(Math.min(width, item.image_width ?? width))}
-                className="rounded-lg bg-black/[0.05] px-2 py-1.5 text-[11px] text-neutral-600 transition hover:bg-black/[0.1] disabled:opacity-40 dark:bg-white/[0.08] dark:text-neutral-300 dark:hover:bg-white/[0.14]"
-              >
-                {width}px
-              </button>
-            ))}
-          </div>
-          <div className="mt-2 flex items-center gap-1.5 text-[10px] text-neutral-500 dark:text-neutral-400" title="Leave height empty to preserve aspect ratio">
-            <Scaling className="size-3" strokeWidth={1.8} />
-            Custom size
-          </div>
-          <div className="mt-1.5 flex gap-1.5">
-            <input
-              value={customWidth}
-              onChange={(event) => setCustomWidth(event.target.value.replace(/\D/g, ""))}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !busy && customValid) {
-                  event.preventDefault();
-                  void resize(parsedWidth, parsedHeight);
-                }
-              }}
-              placeholder="Width"
-              inputMode="numeric"
-              className="min-w-0 flex-1 rounded-lg bg-black/[0.05] px-2 py-1.5 text-[11px] outline-none ring-[var(--accent)] focus:ring-1 dark:bg-white/[0.08]"
-            />
-            <input
-              value={customHeight}
-              onChange={(event) => setCustomHeight(event.target.value.replace(/\D/g, ""))}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !busy && customValid) {
-                  event.preventDefault();
-                  void resize(parsedWidth, parsedHeight);
-                }
-              }}
-              placeholder="Height"
-              inputMode="numeric"
-              className="min-w-0 flex-1 rounded-lg bg-black/[0.05] px-2 py-1.5 text-[11px] outline-none ring-[var(--accent)] focus:ring-1 dark:bg-white/[0.08]"
-            />
-            <button
-              type="button"
-              disabled={busy || !customValid}
-              onClick={() => resize(parsedWidth, parsedHeight)}
-              title="Resize and copy"
-              aria-label="Resize and copy"
-              className="grid size-7 place-items-center rounded-lg bg-[var(--accent)] text-white transition-transform active:scale-[0.92] disabled:opacity-40"
-            >
-              <Copy className="size-3.5" strokeWidth={2} />
-            </button>
-          </div>
-        </div>
-      )}
-
       <dl className="grid grid-cols-[20px_1fr] items-center gap-x-2 gap-y-1.5 text-[11px] text-neutral-500">
-        <Field icon={FileType2} label="Type" value={item.kind} />
+        <Field icon={FileType2} label="Type" value={typeLabel} />
         <Field icon={Database} label="Size" value={bytes(Number(item.byte_size))} />
         <Field icon={CalendarClock} label="Copied" value={when(Number(item.created_at))} />
         {item.source_app && <Field icon={AppWindow} label="From" value={item.source_app} />}
         {item.use_count > 1 && <Field icon={History} label="Used" value={`${item.use_count} times`} />}
-        {item.mimes.length > 1 && <Field icon={Layers3} label="Formats" value={item.mimes.join(", ")} />}
       </dl>
     </aside>
   );

@@ -53,6 +53,7 @@ type EmojiModule = typeof import("./emoji");
 /** How many items the hot list holds. Tier-1 filtering stays instant well past this. */
 const HOT_SIZE = 300;
 const ROW_HEIGHT = 56;
+const IMAGE_ROW_HEIGHT = 92;
 
 /** Keep the hot list in the exact same order as SQLite: pinned first, then most recently used. */
 function upsertItem(prev: Item[], item: Item): Item[] {
@@ -246,9 +247,14 @@ export default function App() {
   const virtualizer = useVirtualizer({
     count: matches.length,
     getScrollElement: () => listRef.current,
-    estimateSize: () => ROW_HEIGHT,
+    getItemKey: (index) => matches[index]?.item.id ?? index,
+    estimateSize: (index) => (matches[index]?.item.kind === "image" ? IMAGE_ROW_HEIGHT : ROW_HEIGHT),
     overscan: 8,
   });
+
+  useEffect(() => {
+    virtualizer.measure();
+  }, [matches, virtualizer]);
 
   useEffect(() => {
     if (activeTab === "clipboard" && matches.length) virtualizer.scrollToIndex(selected, { align: "auto" });
@@ -320,9 +326,17 @@ export default function App() {
     [matches, flash, showToast],
   );
 
-  const handleActivateRow = useCallback(
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
+
+  // Clicking a non-selected row selects it; clicking the already-selected row pastes it.
+  const handleClickRow = useCallback(
     (index: number) => {
-      void act(index, "paste");
+      if (index === selectedRef.current) {
+        void act(index, "paste");
+      } else {
+        setSelected(index);
+      }
     },
     [act],
   );
@@ -477,21 +491,20 @@ export default function App() {
     [act, activeTab, changeTab, emojiMatches, emojiMod, emojiSelected, emojiTone, matches.length, pasteEmoji, selected, query],
   );
 
-  // The search field owns focus permanently, so every keystroke filters
-  // without the user ever reaching for Ctrl+F.
+  // The search field owns focus whenever the popup activates, so typing and
+  // arrow-key navigation always work immediately without reaching for Ctrl+F.
   useEffect(() => {
     inputRef.current?.focus();
+    const onFocus = () => inputRef.current?.focus();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
   }, []);
 
-  // On window, not the panel: clicking anything non-focusable (empty list
-  // space, the preview pane, a row) blurs the input and hands focus to
-  // <body>, which sits *above* the panel in the tree — a listener on the
-  // panel would never see events that originate there. Esc (and every other
-  // shortcut) has to keep working no matter what has focus, so the listener
-  // lives here instead of in onKeyDown JSX.
+  // Capture-phase listener on window so ArrowUp/Down, Enter, Esc, etc. keep
+  // working reliably regardless of which child currently holds focus.
   useEffect(() => {
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    window.addEventListener("keydown", onKeyDown, { capture: true });
+    return () => window.removeEventListener("keydown", onKeyDown, { capture: true });
   }, [onKeyDown]);
 
   // Tauri's own `data-tauri-drag-region` script asks the window manager to
@@ -646,7 +659,7 @@ export default function App() {
                           match={matches[v.index]!}
                           active={v.index === selected}
                           now={now}
-                          onActivate={handleActivateRow}
+                          onClick={handleClickRow}
                         />
                       </div>
                     ))}
@@ -654,7 +667,7 @@ export default function App() {
                 )}
               </div>
 
-              {current?.kind === "image" && <Preview item={current} onMessage={flash} />}
+              {current?.kind === "image" && <Preview item={current} />}
             </>
           )}
         </div>

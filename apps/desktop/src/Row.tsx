@@ -6,7 +6,6 @@ import {
   AppWindow,
   Clock3,
   Code2,
-  FileCode2,
   FileText,
   Folder,
   Globe2,
@@ -24,7 +23,8 @@ const ICONS: Record<Item["kind"], LucideIcon> = {
   url: Globe2,
   code: Code2,
   color: Palette,
-  html: FileCode2,
+  // Rich text items (legacy `html` kind) render as normal text, never as HTML code files.
+  html: FileText,
   image: ImageIcon,
   files: Folder,
 };
@@ -34,24 +34,27 @@ export const Row = memo(function Row({
   match,
   active,
   now,
-  onActivate,
+  onClick,
 }: {
   index: number;
   match: Match;
   active: boolean;
   now: number;
-  onActivate: (index: number) => void;
+  onClick: (index: number) => void;
 }) {
   const { item, ranges } = match;
   const KindIcon = ICONS[item.kind];
+  const isImage = item.kind === "image";
 
   return (
     <div
       role="option"
       aria-selected={active}
-      onClick={() => onActivate(index)}
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={() => onClick(index)}
       className={[
-        "mx-1 flex h-[56px] cursor-pointer select-none items-center gap-3 rounded-xl px-2.5 transition-[background-color,transform] duration-150 active:scale-[0.995]",
+        "mx-1 flex cursor-pointer select-none items-center gap-3 rounded-xl px-2.5 transition-[background-color,transform] duration-150 active:scale-[0.995]",
+        isImage ? "h-[92px]" : "h-[56px]",
         active ? "bg-[var(--selection)]" : "",
       ].join(" ")}
     >
@@ -59,13 +62,13 @@ export const Row = memo(function Row({
         aria-hidden
         className={[
           "grid shrink-0 place-items-center overflow-hidden rounded-xl transition-colors",
-          item.kind === "image" ? "h-10 w-14" : "size-9",
+          isImage ? "h-[76px] w-[144px]" : "size-9",
           active
             ? "bg-white/70 text-[var(--accent)] dark:bg-white/[0.1] dark:text-blue-300"
             : "bg-black/[0.045] text-neutral-500 dark:bg-white/[0.065] dark:text-neutral-400",
         ].join(" ")}
       >
-        {item.kind === "image" ? (
+        {isImage ? (
           <Thumbnail item={item} />
         ) : item.kind === "color" ? (
           <span
@@ -78,20 +81,32 @@ export const Row = memo(function Row({
       </span>
 
       <div className="min-w-0 flex-1">
+        {!isImage && (
+          <div
+            className={[
+              "truncate text-sm",
+              item.sensitive ? "select-none blur-[5px]" : "",
+              item.kind === "code" ? "font-mono text-[13px]" : "",
+            ].join(" ")}
+          >
+            {item.sensitive ? "•••••••••••••••" : <Highlight text={item.preview} ranges={ranges} />}
+          </div>
+        )}
         <div
           className={[
-            "truncate text-sm",
-            item.sensitive ? "select-none blur-[5px]" : "",
-            item.kind === "code" ? "font-mono text-[13px]" : "",
+            "flex flex-wrap items-center gap-x-2.5 gap-y-1 text-neutral-500 dark:text-neutral-400",
+            isImage ? "text-[11px]" : "mt-0.5 text-[10px]",
           ].join(" ")}
         >
-          {item.sensitive ? "•••••••••••••••" : <Highlight text={item.preview} ranges={ranges} />}
-        </div>
-        <div className="mt-0.5 flex items-center gap-2.5 text-[10px] text-neutral-500 dark:text-neutral-400">
           <span className="flex shrink-0 items-center gap-1" title="Last copied">
             <Clock3 aria-hidden className="size-3" strokeWidth={1.8} />
             {ago(Number(item.last_used_at), now)}
           </span>
+          {isImage && item.image_width && item.image_height && (
+            <span className="shrink-0 tabular-nums">
+              {item.image_width} × {item.image_height}
+            </span>
+          )}
           {item.source_app && (
             <span className="flex min-w-0 items-center gap-1" title={`Copied from ${item.source_app}`}>
               <AppWindow aria-hidden className="size-3 shrink-0" strokeWidth={1.8} />
@@ -140,9 +155,9 @@ function Thumbnail({ item }: { item: Item }) {
   }, [item.id, item.has_thumbnail]);
 
   return src ? (
-    <img src={src} alt="" className="h-10 w-14 rounded-xl object-cover" />
+    <img src={src} alt="" className="h-full w-full object-contain" />
   ) : (
-    <ImageIcon aria-hidden className="size-[17px]" strokeWidth={1.8} />
+    <ImageIcon aria-hidden className="size-5" strokeWidth={1.8} />
   );
 }
 

@@ -16,7 +16,8 @@ use crate::detect;
 /// keeping the database small enough to stay in page cache.
 const INLINE_LIMIT: usize = 256 * 1024;
 const PREVIEW_CHARS: usize = 200;
-const THUMBNAIL_EDGE: u32 = 320;
+/// Sharp enough for larger inline + preview-pane thumbnails on HiDPI screens.
+const THUMBNAIL_EDGE: u32 = 640;
 
 /// One clipboard event: every flavor the source app offered, as one unit.
 pub struct Captured {
@@ -40,13 +41,8 @@ impl Captured {
             .or_else(|| self.flavors.first())
     }
 
-    /// Best UTF-8 text flavor, for preview/search/secret-scanning/hashing.
-    ///
-    /// Plain-text flavors win over markup like `text/html` so browser copies
-    /// display readable text rather than raw HTML tags, AND so GNOME's
-    /// ownership hand-off (which often drops `text/html`) hashes identically
-    /// instead of creating duplicate rows. Borrows directly with zero copies.
-    pub fn text(&self) -> Option<&str> {
+    /// First non-empty plain-text flavor (`UTF8_STRING`, `text/plain*`, etc.).
+    pub fn plain_text(&self) -> Option<&str> {
         const PLAIN: &[&str] = &[
             "UTF8_STRING",
             "text/plain;charset=utf-8",
@@ -65,11 +61,21 @@ impl Captured {
                 return Some(s);
             }
         }
+        None
+    }
+
+    /// Fallback non-plain `text/*` flavor (e.g. `text/html` when no plain text was offered).
+    pub fn other_text(&self) -> Option<(&str, &str)> {
         self.flavors
             .iter()
             .filter(|(m, _)| m.starts_with("text/"))
-            .filter_map(|(_, d)| std::str::from_utf8(d).ok())
-            .max_by_key(|s| s.len())
+            .filter_map(|(m, d)| std::str::from_utf8(d).ok().map(|s| (m.as_str(), s)))
+            .max_by_key(|(_, s)| s.len())
+    }
+
+    /// Best UTF-8 text flavor, for preview/search/secret-scanning/hashing.
+    pub fn text(&self) -> Option<&str> {
+        self.plain_text().or_else(|| self.other_text().map(|(_, s)| s))
     }
 }
 
@@ -169,6 +175,64 @@ impl Store {
                 )?;
             }
         }
+        self.migrate_legacy_html_items()?;
+        Ok(())
+    }
+
+    /// Upgrade legacy `kind = 'html'` entries from earlier versions so rich
+    /// text copies show clean readable text rather than HTML file icons/tags.
+    fn migrate_legacy_html_items(&mut self) -> Result<()> {
+        let rows: Vec<(i64, String, bool)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, preview, sensitive FROM items WHERE kind = 'html'")?;
+            let mapped = stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? != 0))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.transaction()?;
+        for (id, old_preview, sensitive) in rows {
+            let plain: Option<String> = tx
+                .query_row(
+                    "SELECT data FROM flavors
+                     WHERE item_id = ?1
+                       AND mime IN ('UTF8_STRING', 'text/plain;charset=utf-8', 'text/plain', 'STRING', 'TEXT')
+                       AND data IS NOT NULL
+                     LIMIT 1",
+                    params![id],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )
+                .optional()?
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .filter(|s| !s.trim().is_empty());
+
+            let clean_text = plain.unwrap_or_else(|| detect::strip_html_to_text(&old_preview));
+            let new_preview = detect::make_preview(&clean_text, PREVIEW_CHARS);
+            let new_kind = kind_str(detect::kind_of_text(&clean_text));
+
+            if !sensitive {
+                tx.execute(
+                    "INSERT INTO items_fts(items_fts, rowid, preview) VALUES('delete', ?1, ?2)",
+                    params![id, old_preview],
+                )?;
+            }
+            tx.execute(
+                "UPDATE items SET kind = ?1, preview = ?2 WHERE id = ?3",
+                params![new_kind, new_preview, id],
+            )?;
+            if !sensitive {
+                tx.execute(
+                    "INSERT INTO items_fts(rowid, preview) VALUES(?1, ?2)",
+                    params![id, new_preview],
+                )?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -206,9 +270,23 @@ impl Store {
             return Ok(None);
         }
 
-        let text = cap.text();
+        // Extract readable text: plain-text flavors win directly, and HTML-only
+        // copies have markup stripped so raw HTML never leaks into history previews.
+        let clean_text: Option<std::borrow::Cow<'_, str>> = if let Some(t) = cap.plain_text() {
+            Some(std::borrow::Cow::Borrowed(t))
+        } else if let Some((mime, raw)) = cap.other_text() {
+            if mime == "text/html" {
+                let stripped = detect::strip_html_to_text(raw);
+                (!stripped.is_empty()).then_some(std::borrow::Cow::Owned(stripped))
+            } else {
+                Some(std::borrow::Cow::Borrowed(raw))
+            }
+        } else {
+            None
+        };
+
         let sensitive = cap.hinted_secret
-            || text.map(detect::is_sensitive).unwrap_or(false);
+            || clean_text.as_deref().map(detect::is_sensitive).unwrap_or(false);
         if sensitive && !store_secrets {
             // Still update the head so the re-offer that follows is suppressed
             // too, otherwise the secret round-trips through here twice.
@@ -234,8 +312,16 @@ impl Store {
             return self.get(id);
         }
 
-        let kind = detect::kind_of(&best_mime, &best_data);
-        let preview = match (text, kind) {
+        let kind = if best_mime.starts_with("image/") {
+            Kind::Image
+        } else if best_mime == "text/uri-list" {
+            Kind::Files
+        } else if let Some(t) = clean_text.as_deref() {
+            detect::kind_of_text(t)
+        } else {
+            detect::kind_of(&best_mime, &best_data)
+        };
+        let preview = match (clean_text.as_deref(), kind) {
             (Some(t), _) => detect::make_preview(t, PREVIEW_CHARS),
             (None, Kind::Image) => format!("Image · {}", human_size(best_data.len())),
             (None, _) => format!("{} · {}", best_mime, human_size(best_data.len())),
