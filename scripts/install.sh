@@ -72,62 +72,58 @@ else
 fi
 
 command -v curl >/dev/null 2>&1 || {
-    [[ "$DRY_RUN" == 1 ]] || { sudo apt-get update; sudo apt-get install -y curl ca-certificates python3; }
-}
-command -v python3 >/dev/null 2>&1 || {
-    [[ "$DRY_RUN" == 1 ]] || { sudo apt-get update; sudo apt-get install -y python3; }
+    [[ "$DRY_RUN" == 1 ]] || { sudo apt-get update; sudo apt-get install -y curl ca-certificates; }
 }
 
-API="https://api.github.com/repos/$REPO/releases"
 if [[ -n "$RELEASE_VERSION" ]]; then
     RELEASE_VERSION="${RELEASE_VERSION#v}"
-    API="$API/tags/v$RELEASE_VERSION"
+    BASE_URL="https://github.com/$REPO/releases/download/v$RELEASE_VERSION"
 else
-    API="$API/latest"
+    BASE_URL="https://github.com/$REPO/releases/latest/download"
 fi
+SUM_URL="$BASE_URL/SHA256SUMS"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-JSON="$TMP/release.json"
+SUMS="$TMP/SHA256SUMS"
 
 info "Detected ${ID:-Debian} ${ARCH} on ${SESSION}"
 info "Release source: https://github.com/$REPO/releases"
 
 if [[ "$DRY_RUN" == 1 ]]; then
-    info "Would fetch: $API"
+    info "Would fetch: $SUM_URL"
     info "Would install: clipd_${RELEASE_VERSION:-latest}_${ARCH}.deb"
     ((${#SESSION_PACKAGES[@]})) && info "Would install session tools: ${SESSION_PACKAGES[*]}"
     exit 0
 fi
 
-curl -fsSL --retry 3 -o "$JSON" "$API" || die "could not fetch release metadata"
+# Fetch SHA256SUMS directly from GitHub Releases (no api.github.com call, so
+# shared/NAT IPs never hit the 60 req/hr unauthenticated API rate limit).
+curl -fsSL --retry 3 -o "$SUMS" "$SUM_URL" || die "could not fetch release checksums from $SUM_URL"
 
-ASSETS="$(python3 - "$JSON" "$ARCH" <<'PY'
-import json, sys
-release = json.load(open(sys.argv[1], encoding="utf-8"))
-arch = sys.argv[2]
-assets = {asset["name"]: asset["browser_download_url"] for asset in release.get("assets", [])}
-# Prefer the versioned .deb (clipd_<ver>_<arch>.deb) over the version-less alias.
-deb = next(
-    (name for name in assets if name.startswith("clipd_") and name.endswith(f"_{arch}.deb") and name != f"clipd_{arch}.deb"),
-    None,
-) or next((name for name in assets if name == f"clipd_{arch}.deb"), None)
-checksums = next((name for name in assets if name == "SHA256SUMS"), None)
-if not deb or not checksums:
-    raise SystemExit("release is missing the matching .deb or SHA256SUMS asset")
-print(deb)
-print(assets[deb])
-print(assets[checksums])
-print(release.get("tag_name", "").lstrip("v"))
-PY
-)" || die "release does not contain a $ARCH .deb and SHA256SUMS"
+# Prefer the versioned .deb (clipd_<ver>_<arch>.deb) listed in SHA256SUMS,
+# falling back to the version-less clipd_<arch>.deb alias.
+DEB_NAME="$(awk -v arch="$ARCH" '
+    {
+        f = $2
+        sub(/^\*/, "", f)
+        if (f ~ ("^clipd_[^_]+_" arch "\\.deb$")) { versioned = f }
+        else if (f == ("clipd_" arch ".deb")) { alias = f }
+    }
+    END {
+        if (versioned != "") print versioned
+        else if (alias != "") print alias
+    }
+' "$SUMS")"
+[[ -n "$DEB_NAME" ]] || die "release does not contain a $ARCH .deb in SHA256SUMS"
 
-DEB_NAME="$(sed -n '1p' <<<"$ASSETS")"
-DEB_URL="$(sed -n '2p' <<<"$ASSETS")"
-SUM_URL="$(sed -n '3p' <<<"$ASSETS")"
-TARGET_VER="$(sed -n '4p' <<<"$ASSETS")"
+TARGET_VER="$RELEASE_VERSION"
+if [[ -z "$TARGET_VER" && "$DEB_NAME" =~ ^clipd_([^_]+)_${ARCH}\.deb$ ]]; then
+    TARGET_VER="${BASH_REMATCH[1]}"
+fi
+
+DEB_URL="$BASE_URL/$DEB_NAME"
 DEB="$TMP/$DEB_NAME"
-SUMS="$TMP/SHA256SUMS"
 
 INSTALLED_VER="$(dpkg-query -W -f='${Version}\n' clipd 2>/dev/null || true)"
 if [[ -n "$INSTALLED_VER" && -n "$TARGET_VER" ]]; then
@@ -139,20 +135,28 @@ if [[ -n "$INSTALLED_VER" && -n "$TARGET_VER" ]]; then
 fi
 
 info "Downloading $DEB_NAME"
-curl -fL --retry 3 --progress-bar -o "$DEB" "$DEB_URL"
-curl -fsSL --retry 3 -o "$SUMS" "$SUM_URL"
+curl -fL --retry 3 --progress-bar -o "$DEB" "$DEB_URL" || die "could not download $DEB_URL"
 chmod 755 "$TMP"
 chmod 644 "$DEB"
 
-HASH="$(awk -v file="$DEB_NAME" '$2 == file || $2 == "*" file { print $1; exit }' "$SUMS")"
+HASH="$(awk -v file="$DEB_NAME" '{ f = $2; sub(/^\*/, "", f); if (f == file) { print $1; exit } }' "$SUMS")"
 [[ "$HASH" =~ ^[0-9a-fA-F]{64}$ ]] || die "no SHA-256 entry found for $DEB_NAME"
 printf '%s  %s\n' "$HASH" "$DEB" | sha256sum -c - >/dev/null || die "checksum verification failed"
 ok "Verified SHA-256 checksum"
 
-sudo apt-get update
-if ((${#SESSION_PACKAGES[@]})); then
-    info "Installing Wayland clipboard support: ${SESSION_PACKAGES[*]}"
-    sudo apt-get install -y "${SESSION_PACKAGES[@]}"
+MISSING_SESSION_PACKAGES=()
+for pkg in "${SESSION_PACKAGES[@]}"; do
+    if ! dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+        MISSING_SESSION_PACKAGES+=("$pkg")
+    fi
+done
+
+if [[ -z "$INSTALLED_VER" ]] || ((${#MISSING_SESSION_PACKAGES[@]})); then
+    sudo apt-get update || warn "apt-get update reported an error; continuing with local .deb install"
+fi
+if ((${#MISSING_SESSION_PACKAGES[@]})); then
+    info "Installing Wayland clipboard support: ${MISSING_SESSION_PACKAGES[*]}"
+    sudo apt-get install -y "${MISSING_SESSION_PACKAGES[@]}"
 fi
 sudo env CLIPD_INSTALLER=1 apt install -y --reinstall "$DEB"
 ok "clipd ${TARGET_VER:-package} installed"
