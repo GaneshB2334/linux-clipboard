@@ -1,0 +1,87 @@
+name: Publish GitHub Package
+
+on:
+  release:
+    types: [published, released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (defaults to latest release)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish-oci-package:
+    name: Publish .deb OCI package to GHCR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release tag
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          elif [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="$(gh release view --repo "${{ github.repository }}" --json tagName -q .tagName)"
+          fi
+          VERSION="${TAG#v}"
+          OWNER="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "owner=${OWNER}" >> "$GITHUB_OUTPUT"
+          echo "Publishing tag=${TAG} version=${VERSION} owner=${OWNER}"
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p pkg
+          gh release download "${{ steps.meta.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --dir pkg \
+            --pattern "clipd_*.deb" \
+            --pattern "SHA256SUMS"
+          ls -la pkg
+          (cd pkg && sha256sum -c SHA256SUMS --ignore-missing)
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@v1
+
+      - name: Log in to GitHub Container Registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push .deb package to GitHub Packages (GHCR)
+        working-directory: pkg
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          OWNER="${{ steps.meta.outputs.owner }}"
+          REPO="${{ github.repository }}"
+
+          DEB_FILE="clipd_${VERSION}_amd64.deb"
+          if [ ! -f "$DEB_FILE" ]; then
+            DEB_FILE="clipd_amd64.deb"
+          fi
+          if [ ! -f "$DEB_FILE" ]; then
+            echo "No amd64 .deb found in release ${{ steps.meta.outputs.tag }}" >&2
+            exit 1
+          fi
+
+          oras push \
+            --artifact-type application/vnd.debian.binary-package \
+            --annotation "org.opencontainers.image.source=https://github.com/${REPO}" \
+            --annotation "org.opencontainers.image.url=https://github.com/${REPO}" \
+            --annotation "org.opencontainers.image.title=clipd" \
+            --annotation "org.opencontainers.image.description=Win+V style clipboard manager for Linux (.deb package)" \
+            --annotation "org.opencontainers.image.licenses=GPL-3.0-or-later" \
+            --annotation "org.opencontainers.image.version=${VERSION}" \
+            "ghcr.io/${OWNER}/clipd:${VERSION},v${VERSION},latest" \
+            "${DEB_FILE}:application/vnd.debian.binary-package" \
+            "SHA256SUMS:text/plain"
